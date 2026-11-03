@@ -1,0 +1,10 @@
+{
+  "name": "stats-dashboard",
+  "private": true,
+  "type": "module",
+  "description": "Tests + docs for the /stats extension (lives in ~/.pi/agent/extensions/stats.ts)",
+  "scripts": {
+    "test": "node test/stats-core.test.ts && node test/stats-integration.test.ts",
+    "typecheck": "node /home/julian/.npm/_npx/a322a253dbd59f36/node_modules/typescript/bin/tsc -p tsconfig.json"
+  }
+}

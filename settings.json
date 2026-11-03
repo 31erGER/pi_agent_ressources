@@ -1,0 +1,9 @@
+{
+  "lastChangelogVersion": "1.5.0",
+  "showHardwareCursor": true,
+  "httpIdleTimeoutMs": 0,
+  "enableInstallTelemetry": false,
+  "extensions": [
+    "/home/julian/.pi/projects/audio-notification/notify-on-settle.ts"
+  ]
+}

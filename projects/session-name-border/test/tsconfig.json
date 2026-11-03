@@ -1,0 +1,21 @@
+{
+	"compilerOptions": {
+		"noEmit": true,
+		"strict": true,
+		"target": "es2022",
+		"module": "esnext",
+		"moduleResolution": "bundler",
+		"skipLibCheck": true,
+		"types": [],
+		"baseUrl": ".",
+		"paths": {
+			"@earendil-works/pi-coding-agent": [
+				"/home/julian/.pi/agent/install/releases/1.4.0/node_modules/@earendil-works/pi-coding-agent/dist/index.d.ts"
+			],
+			"@earendil-works/pi-tui": [
+				"/home/julian/.pi/agent/install/releases/1.4.0/node_modules/@earendil-works/pi-tui/dist/index.d.ts"
+			]
+		}
+	},
+	"files": ["/home/julian/.pi/agent/extensions/session-name-border.ts"]
+}
