@@ -18,6 +18,10 @@
  *     ~/.pi/agent/usage-stats.json, overridable via PI_STATS_USAGE_FILE; sibling
  *     extensions self-report via trackExtensionRun; every tool_execution_start is
  *     counted via trackToolUse)
+ *   - changes (v1.4): added/deleted LINES (code + text combined) in the session
+ *     cwd since session start — git numstat vs. a session-start HEAD baseline
+ *     (commits during the session still count) + untracked files; one cached
+ *     git spawn per 2 s (see collectGitChanges)
  *
  * Layout (v1.3): two columns split by a middle border divider — LEFT = live
  * session state (context, prompt sections, messages, tokens, performance),
@@ -42,6 +46,7 @@
  *
  * Auto-loaded from ~/.pi/agent/extensions/.
  */
+import { exec } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -149,6 +154,12 @@ export interface StatsData {
   resources: LoadedResources;
   usage: UsageSection;
   performance: PerformanceSection;
+  /** v1.4: git changes for the session cwd (undefined = still loading). */
+  git?: GitChangesResult;
+  /** v1.5: MTP acceptance rate from LM Studio (absent/null = no data / not probed). */
+  mtp?: MtpStats | null;
+  /** v1.5: performance-impact rating (1 cheap … 5 costly) per extension/tool. */
+  ratings?: RatingsSection;
 }
 
 /** One tracked record in the global usage store. */
@@ -196,11 +207,15 @@ export interface PerformanceSection {
   session: PerfWindow;
   last10: PerfWindow;
   last100: PerfWindow;
+  /** v1.5: the single most recent turn (rate over its own span). */
+  last?: PerfWindow;
 }
 
 export interface CollectStatsOptions {
   /** Override the global usage store file (tests). */
   usageStorePath?: string;
+  /** Override the global perf store file (tests). */
+  perfStorePath?: string;
 }
 
 /** Structural subset of ExtensionAPI needed to list loaded resources. */
@@ -455,6 +470,318 @@ export class UsageStore {
   }
 }
 
+// ------------------------------------------- v1.5: MTP acceptance + perf rating
+
+/** Global tool-duration store location (PI_STATS_PERF_FILE overrides for tests). */
+export function perfStorePath(): string {
+  const env = process.env.PI_STATS_PERF_FILE;
+  if (env && env.length > 0) return path.resolve(env);
+  return path.join(getAgentDir(), "perf-stats.json");
+}
+
+/** One measured aggregate per tool in the perf store. */
+export interface PerfRecord {
+  calls: number;
+  totalMs: number;
+  maxMs: number;
+  firstSeen: string;
+  lastUsed: string;
+}
+
+/** Shape of the global tool-perf store file (~/.pi/agent/perf-stats.json). */
+export interface PerfData {
+  version: number;
+  tools: Record<string, PerfRecord>;
+}
+
+function normalizePerfData(parsed: unknown): PerfData {
+  const p = (parsed && typeof parsed === "object" ? parsed : {}) as Record<string, unknown>;
+  const tools: Record<string, PerfRecord> = {};
+  if (p.tools && typeof p.tools === "object" && !Array.isArray(p.tools)) {
+    for (const [k, raw] of Object.entries(p.tools as Record<string, unknown>)) {
+      const r = (raw && typeof raw === "object" ? raw : {}) as Record<string, unknown>;
+      const num = (v: unknown): number =>
+        typeof v === "number" && Number.isFinite(v) && v >= 0 ? v : 0;
+      tools[k] = {
+        calls: Math.floor(num(r.calls)),
+        totalMs: num(r.totalMs),
+        maxMs: num(r.maxMs),
+        firstSeen: typeof r.firstSeen === "string" ? r.firstSeen : new Date(0).toISOString(),
+        lastUsed: typeof r.lastUsed === "string" ? r.lastUsed : new Date(0).toISOString(),
+      };
+    }
+  }
+  return { version: 1, tools };
+}
+
+/**
+ * Global (across sessions/processes) tool-duration measurements feeding the
+ * perf rating. Same read-modify-write + corrupt-reset contract as UsageStore.
+ * Invalid durations (missing/≤0/non-finite) are NOT recorded.
+ */
+export class PerfStore {
+  readonly filePath: string;
+
+  constructor(filePath?: string) {
+    this.filePath = filePath ? path.resolve(filePath) : perfStorePath();
+  }
+
+  load(): PerfData {
+    try {
+      return normalizePerfData(JSON.parse(fs.readFileSync(this.filePath, "utf-8")));
+    } catch {
+      return { version: 1, tools: {} };
+    }
+  }
+
+  snapshot(): PerfData {
+    return this.load();
+  }
+
+  /** Average ms/call for a tool (null when there is no data). */
+  avgMs(tool: string): number | null {
+    const rec = this.load().tools[tool];
+    return rec && rec.calls > 0 ? rec.totalMs / rec.calls : null;
+  }
+
+  record(tool: string, ms: number, now: number = Date.now()): PerfData {
+    if (!tool || !Number.isFinite(ms) || ms <= 0) return this.load();
+    const data = this.load();
+    const prev = data.tools[tool];
+    const iso = new Date(now).toISOString();
+    data.tools[tool] = prev
+      ? {
+          calls: prev.calls + 1,
+          totalMs: prev.totalMs + ms,
+          maxMs: Math.max(prev.maxMs, ms),
+          firstSeen: prev.firstSeen,
+          lastUsed: iso,
+        }
+      : { calls: 1, totalMs: ms, maxMs: ms, firstSeen: iso, lastUsed: iso };
+    try {
+      fs.mkdirSync(path.dirname(this.filePath), { recursive: true });
+      fs.writeFileSync(this.filePath, JSON.stringify(data, null, 2));
+    } catch {
+      // never break the caller's flow over a stats counter
+    }
+    return data;
+  }
+}
+
+/** LM Studio speculative-decoding (MTP) counters from a completion response. */
+export interface MtpStats {
+  total: number;
+  accepted: number;
+  rejected: number;
+  ignored: number;
+  rate: number;
+}
+
+function asFinite(v: unknown): number {
+  const n = typeof v === "number" ? v : Number(v);
+  return Number.isFinite(n) ? n : 0;
+}
+
+/**
+ * Parse the `stats` object LM Studio attaches to completion responses
+ * ({total,accepted,rejected,ignored}_draft_tokens_count). Returns null when the
+ * server reported no draft traffic (empty stats / total 0 / missing) — the
+ * dashboard then shows no MTP row at all.
+ */
+export function parseMtpStats(body: unknown): MtpStats | null {
+  const s = (body as { stats?: unknown } | null | undefined)?.stats;
+  if (!s || typeof s !== "object") return null;
+  const o = s as Record<string, unknown>;
+  const total = Math.floor(asFinite(o.total_draft_tokens_count));
+  if (total <= 0) return null;
+  const accepted = Math.min(total, Math.floor(asFinite(o.accepted_draft_tokens_count)));
+  return {
+    total,
+    accepted,
+    rejected: Math.floor(asFinite(o.rejected_draft_tokens_count)),
+    ignored: Math.floor(asFinite(o.ignored_draft_tokens_count)),
+    rate: accepted / total,
+  };
+}
+
+/** In-process MTP probe cache (60 s) so repeated probes/refreshes stay cheap. */
+let mtpProbeCache: { model: string; at: number; value: MtpStats | null } | null = null;
+
+/** Test hook: drop the MTP probe cache. */
+export function mtpProbeCacheForTests(): void {
+  mtpProbeCache = null;
+}
+
+/**
+ * Probe LM Studio for the MTP acceptance rate: one tiny chat completion
+ * (max_tokens 32) whose response carries the draft-token counters. Callers gate
+ * on provider === "lmstudio"; never throws (null = no data → no dashboard row).
+ */
+export async function probeMtpAcceptance(
+  modelId: string,
+  baseUrl?: string,
+  timeoutMs = 5000,
+): Promise<MtpStats | null> {
+  const base = (baseUrl ?? process.env.LM_STUDIO_BASE_URL ?? "http://localhost:1234").replace(/\/+$/, "");
+  const now = Date.now();
+  if (mtpProbeCache && mtpProbeCache.model === modelId && now - mtpProbeCache.at < 60_000) {
+    return mtpProbeCache.value;
+  }
+  let value: MtpStats | null = null;
+  try {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+    const res = await fetch(`${base}/v1/chat/completions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      signal: ctrl.signal,
+      body: JSON.stringify({
+        model: modelId,
+        messages: [{ role: "user", content: "Reply with exactly: ok" }],
+        max_tokens: 32,
+        temperature: 0,
+        stream: false,
+      }),
+    });
+    clearTimeout(timer);
+    if (res.ok) value = parseMtpStats(await res.json());
+  } catch {
+    value = null; // server down / timeout / bad response → no MTP row
+  }
+  mtpProbeCache = { model: modelId, at: Date.now(), value };
+  return value;
+}
+
+// ---------------------------------------- perf rating (1 cheap … 5 costly)
+
+/** Band edges: value ≥ edge ⇒ one band up (score 1..5). See PERFORMANCE-RATING.md. */
+export const RATING_BANDS = {
+  durationMs: [50, 200, 1_000, 10_000],
+  calls: [10, 100, 1_000, 10_000],
+  bytes: [2_048, 8_192, 32_768, 102_400],
+  subscriptions: [2, 4, 6, 10],
+} as const;
+
+/** Weights of the composite rating (sum = 1). */
+export const RATING_WEIGHTS = { duration: 0.5, frequency: 0.3, static: 0.2 } as const;
+
+function bandScore(bands: readonly number[], v: number): number {
+  let s = 1;
+  for (const b of bands) if (v >= b) s++;
+  return s;
+}
+
+/** Static (source-level) metrics — pure over the source text. */
+export function staticSourceMetrics(source: string): { bytes: number; subs: number; tui: boolean } {
+  const subs = (source.match(/pi\.on\(/g) ?? []).length;
+  const tui = /ui\.custom\(|showOverlay\(|registerComponent\(/.test(source);
+  return { bytes: Buffer.byteLength(source, "utf-8"), subs, tui };
+}
+
+const staticMetricsCache = new Map<string, { at: number; value: { bytes: number; subs: number; tui: boolean } | null }>();
+
+/** Read an extension file and compute static metrics (30 s TTL cache). null = unreadable. */
+export function extensionStaticMetrics(filePath: string): { bytes: number; subs: number; tui: boolean } | null {
+  const hit = staticMetricsCache.get(filePath);
+  const now = Date.now();
+  if (hit && now - hit.at < 30_000) return hit.value;
+  let value: { bytes: number; subs: number; tui: boolean } | null = null;
+  try {
+    value = staticSourceMetrics(fs.readFileSync(filePath, "utf-8"));
+  } catch {
+    value = null;
+  }
+  staticMetricsCache.set(filePath, { at: now, value });
+  return value;
+}
+
+/** Implementation size of a tool in bytes (built-ins: dist/core/tools/<name>.js; else null). */
+export function toolImplBytes(name: string): number | null {
+  const root = piPackageRoot();
+  if (!root) return null;
+  try {
+    return fs.statSync(path.join(root, "dist/core/tools", `${name}.js`)).size;
+  } catch {
+    return null;
+  }
+}
+
+export interface RatingInput {
+  kind: "tool" | "extension";
+  name: string;
+  /** Global runs (usage store). */
+  calls: number;
+  /** Measured average ms/call (perf store); null = no data yet. */
+  avgMs: number | null;
+  /** Source/implementation size in bytes; null = unknown (neutral). */
+  bytes: number | null;
+  /** Extensions: pi.on() subscription count (per-event overhead). */
+  subscriptions?: number;
+  /** Extensions: renders per TUI frame (ui.custom/showOverlay/registerComponent). */
+  tuiPerFrame?: boolean;
+}
+
+export interface ItemRating {
+  name: string;
+  kind: "tool" | "extension";
+  /** Composite 1 (cheap) … 5 (costly). */
+  rating: number;
+  duration: number;
+  frequency: number;
+  static: number;
+  avgMs: number | null;
+  calls: number;
+}
+
+/** Composite performance-impact rating; bands/weights in RATING_BANDS / RATING_WEIGHTS. */
+export function rateItem(i: RatingInput): ItemRating {
+  const duration = i.avgMs == null ? 1 : bandScore(RATING_BANDS.durationMs, i.avgMs);
+  const frequency = bandScore(RATING_BANDS.calls, Math.max(0, i.calls));
+  let stat: number;
+  if (i.kind === "extension") {
+    stat = Math.max(
+      i.bytes == null ? 3 : bandScore(RATING_BANDS.bytes, i.bytes),
+      bandScore(RATING_BANDS.subscriptions, i.subscriptions ?? 0),
+    );
+    if (i.tuiPerFrame) stat = Math.min(5, stat + 1);
+  } else {
+    stat = i.bytes == null ? 3 : bandScore(RATING_BANDS.bytes, i.bytes);
+  }
+  const overall = Math.round(
+    RATING_WEIGHTS.duration * duration + RATING_WEIGHTS.frequency * frequency + RATING_WEIGHTS.static * stat,
+  );
+  return {
+    name: i.name,
+    kind: i.kind,
+    rating: Math.min(5, Math.max(1, overall)),
+    duration,
+    frequency,
+    static: stat,
+    avgMs: i.avgMs,
+    calls: i.calls,
+  };
+}
+
+export interface RatedItem {
+  name: string;
+  rating: number;
+  avgMs: number | null;
+  calls: number;
+}
+
+export interface RatingsSection {
+  extensions: RatedItem[];
+  tools: RatedItem[];
+}
+
+/** Milliseconds → "52ms" / "2.5s" / "1m0s" / … (delegates to formatDuration ≥ 1 min). */
+export function formatMs(ms: number): string {
+  if (!Number.isFinite(ms) || ms < 0) return "—";
+  if (ms < 1_000) return `${Math.round(ms)}ms`;
+  if (ms < 60_000) return `${(ms / 1000).toFixed(1).replace(/\.0$/, "")}s`;
+  return formatDuration(ms / 1000);
+}
+
 /** Extract the skill name from an explicit `/skill:name` input (or null). */
 export function attributeSkillInput(text: string): string | null {
   if (typeof text !== "string" || !text.startsWith("/skill:")) return null;
@@ -669,11 +996,31 @@ function windowStats(items: readonly WorkItem[]): PerfWindow {
 }
 
 /** tokens/s for the whole session, last 10 and last 100 work items (turn order). */
+/**
+ * Rate of the single most recent work item (the "last turn"): its output tokens
+ * over the wall time since the previous item. Null rate when there is no
+ * previous item or the span is zero.
+ */
+export function lastTurnWindow(items: readonly WorkItem[]): PerfWindow {
+  const n = items.length;
+  if (n === 0) return { count: 0, tokens: 0, seconds: 0, tps: null };
+  const last = items[n - 1];
+  const spanSec = n >= 2 ? (last.timestamp - items[n - 2].timestamp) / 1000 : 0;
+  const ok = n >= 2 && Number.isFinite(spanSec) && spanSec > 0 && last.tokens > 0;
+  return {
+    count: 1,
+    tokens: last.tokens,
+    seconds: ok ? spanSec : 0,
+    tps: ok ? last.tokens / spanSec : null,
+  };
+}
+
 export function perfStats(items: readonly WorkItem[]): PerformanceSection {
   return {
     session: windowStats(items),
     last10: windowStats(items.slice(-10)),
     last100: windowStats(items.slice(-100)),
+    last: lastTurnWindow(items),
   };
 }
 
@@ -762,15 +1109,193 @@ export interface StatsColumns {
   footer: StatsLine;
 }
 
+// ------------------------------------------------------------ git changes (v1.4)
+
+/** Per-file line change (from `git diff --numstat`). */
+export interface GitChangeFile {
+  path: string;
+  added: number;
+  deleted: number;
+}
+
+/**
+ * Aggregated changes for one cwd: tracked diff (baseline→working tree, so commits
+ * made during the session still count) plus untracked files (their lines = added).
+ * Code and text are combined — every file counts, lines = newline counts.
+ */
+export interface GitChanges {
+  added: number;
+  deleted: number;
+  files: number;
+  untracked: { files: number; added: number };
+  /** All changed files, sorted by (added+deleted) desc. */
+  top: GitChangeFile[];
+}
+
+/**
+ * Result of a git changes probe. An ABSENT `StatsData.git` (undefined) means
+ * "still loading" — the dashboard omits the section until the probe answers.
+ */
+export type GitChangesResult =
+  | { kind: "changes"; changes: GitChanges }
+  | { kind: "not-repo" }
+  | { kind: "unavailable"; reason: string };
+
+const GIT_TTL_MS = 2_000;
+const GIT_TIMEOUT_MS = 5_000;
+
+interface GitCacheEntry {
+  at: number;
+  value: GitChangesResult;
+}
+
+const gitCache = new Map<string, GitCacheEntry>();
+const gitInFlightMap = new Map<string, Promise<GitChangesResult>>();
+
+/** Single-quoted shell escape (cwd/ref values are internal, but stay safe). */
+function shellQuote(s: string): string {
+  return `'${s.replace(/'/g, "'\\''")}'`;
+}
+
+/** Parse `git diff --numstat <ref>` output. `-` counts = binary file (0 lines). */
+export function parseNumstat(output: string): Omit<GitChanges, "untracked"> {
+  let added = 0;
+  let deleted = 0;
+  let files = 0;
+  const top: GitChangeFile[] = [];
+  for (const line of output.split("\n")) {
+    const m = /^(\d+|-)\t(\d+|-)\t(.+)$/.exec(line);
+    if (!m) continue;
+    files++;
+    const a = m[1] === "-" ? 0 : Number(m[1]);
+    const del = m[2] === "-" ? 0 : Number(m[2]);
+    added += a;
+    deleted += del;
+    top.push({ path: m[3], added: a, deleted: del });
+  }
+  top.sort(
+    (x, y) =>
+      y.added + y.deleted - (x.added + x.deleted) ||
+      y.added - x.added ||
+      x.path.localeCompare(y.path),
+  );
+  return { added, deleted, files, top };
+}
+
+/** Parse `wc -l` output for untracked files; skips `total` lines (xargs may run wc several times). */
+export function parseUntrackedWc(output: string): { files: number; added: number } {
+  let files = 0;
+  let added = 0;
+  for (const line of output.split("\n")) {
+    const m = /^\s*(\d+)\s+(.+)$/.exec(line);
+    if (!m || m[2] === "total") continue;
+    files++;
+    added += Number(m[1]);
+  }
+  return { files, added };
+}
+
+/**
+ * Probe git changes for `cwd` (the MOST EFFICIENT way: ONE shell spawn that runs
+ * both invocations, `--no-optional-locks` so it never blocks other git processes,
+ * 5 s timeout, 2 s TTL cache per cwd+baseline with in-flight dedupe — live
+ * refreshes never re-spawn inside the window). `baseline` = HEAD at session start
+ * (null → falls back to `HEAD` = uncommitted changes only).
+ */
+export function collectGitChanges(cwd: string, baseline?: string | null): Promise<GitChangesResult> {
+  const key = `${cwd}\0${baseline ?? ""}`;
+  const cached = gitCache.get(key);
+  if (cached && Date.now() - cached.at < GIT_TTL_MS) return Promise.resolve(cached.value);
+  const inflight = gitInFlightMap.get(key);
+  if (inflight) return inflight;
+  const ref = baseline ?? "HEAD";
+  const script =
+    `git --no-optional-locks -C ${shellQuote(cwd)} diff --numstat ${shellQuote(ref)} 2>&1; ` +
+    `printf '\n--UNTRACKED--\n'; ` +
+    `git --no-optional-locks -C ${shellQuote(cwd)} ls-files --others --exclude-standard -z 2>/dev/null | ` +
+    `xargs -0 -r wc -l -- 2>/dev/null`;
+  const p = new Promise<GitChangesResult>((resolve) => {
+    exec(script, { timeout: GIT_TIMEOUT_MS, maxBuffer: 8 * 1024 * 1024, cwd }, (error, stdout, stderr) => {
+      const out = stdout ?? "";
+      let result: GitChangesResult;
+      if (error && !out) {
+        result = /not a git repository|ENOENT/i.test(stderr || error.message)
+          ? { kind: "not-repo" }
+          : { kind: "unavailable", reason: String(error.message || stderr || "git failed").slice(0, 80) };
+      } else {
+        const idx = out.indexOf("--UNTRACKED--");
+        const numstatPart = idx >= 0 ? out.slice(0, idx) : out;
+        const wcPart = idx >= 0 ? out.slice(idx + "--UNTRACKED--".length) : "";
+        // git >= 2.31-ish prints `warning: Not a git repository` (plus a usage dump,
+        // exit 0) outside a repo; older versions print `fatal: not a git repository`
+        if (/not a git repository/i.test(numstatPart)) {
+          result = { kind: "not-repo" };
+        } else {
+          // fresh repo (no HEAD yet) or stale baseline → no tracked lines, untracked still counted
+          const tracked = /fatal: (ambiguous argument|bad revision)/i.test(numstatPart)
+            ? { added: 0, deleted: 0, files: 0, top: [] as GitChangeFile[] }
+            : parseNumstat(numstatPart);
+          result = { kind: "changes", changes: { ...tracked, untracked: parseUntrackedWc(wcPart) } };
+        }
+      }
+      gitCache.set(key, { at: Date.now(), value: result });
+      gitInFlightMap.delete(key);
+      resolve(result);
+    });
+  });
+  gitInFlightMap.set(key, p);
+  return p;
+}
+
+let gitBaseline: { cwd: string; head: string | null } | undefined;
+
+/**
+ * Capture HEAD for `cwd` as the session-start baseline (in-memory only — zero
+ * persistence, display-only rule intact). Called on `resources_discover` (fires
+ * with cwd at startup/reload, i.e. session start). Failure keeps head=null →
+ * `collectGitChanges` falls back to plain `HEAD`.
+ */
+export function captureGitBaseline(cwd: string): void {
+  gitBaseline = { cwd, head: null };
+  exec(`git --no-optional-locks -C ${shellQuote(cwd)} rev-parse --verify HEAD`, { timeout: 3_000 }, (error, stdout) => {
+    if (error) return;
+    if (gitBaseline?.cwd !== cwd) return; // a newer session overwrote us
+    gitBaseline.head = stdout.trim() || null;
+  });
+}
+
+/** Current git baseline (handler + tests). */
+export function currentGitBaseline(): { cwd: string; head: string | null } | undefined {
+  return gitBaseline;
+}
+
+/** Test-only: drop the TTL cache + in-flight entries (lets tests re-probe a changed repo). */
+export function resetGitProbeCacheForTests(): void {
+  gitCache.clear();
+  gitInFlightMap.clear();
+}
+
 /**
  * Split the dashboard into two meaningful groups (v1.3):
  *   left  = "stats"       — live session state (header, context window, system
- *                           prompt sections, messages, tokens, performance)
+ *                           prompt sections, messages, tokens, changes, performance)
  *   right = "environment" — what is loaded and how it is used (loaded resources,
  *                           tools, global usage)
  * `leftWidth` / `rightWidth` are the visible cell widths used for wrapping.
  * No information from the single-column layout was dropped — only regrouped.
  */
+/**
+ * First-column width for a table of rows: every label is padded so the second
+ * column starts at the SAME index on every row (aligned columns, no matter how
+ * long a name gets). `min` keeps the compact look while all labels are short;
+ * the longest label gets exactly `gap` trailing spaces.
+ */
+export function columnWidth(labels: string[], min = 14, gap = 2): number {
+  let width = min;
+  for (const l of labels) width = Math.max(width, l.length + gap);
+  return width;
+}
+
 export function buildStatsColumns(d: StatsData, leftWidth: number, rightWidth: number): StatsColumns {
   const left: StatsLine[] = [];
   const right: StatsLine[] = [];
@@ -812,11 +1337,14 @@ export function buildStatsColumns(d: StatsData, leftWidth: number, rightWidth: n
   if (d.systemPrompt.sections.length === 0) {
     addL("  (empty)", "dim");
   } else {
+    const sectionLabel = (s: SectionStat): string =>
+      s.name === "skills" && d.skillsInPrompt > 0 ? `skills (${d.skillsInPrompt})` : s.name;
+    const secW = columnWidth(d.systemPrompt.sections.map(sectionLabel), 18);
+    const fileW = columnWidth(d.contextFiles.map((f) => f.path), 16);
     for (const s of d.systemPrompt.sections) {
-      const label = s.name === "skills" && d.skillsInPrompt > 0 ? `skills (${d.skillsInPrompt})` : s.name;
-      addL(`  ${label.padEnd(18)}~${formatNumber(s.tokens)}  (${pctOf(s.tokens, d.systemPrompt.total)})`);
+      addL(`  ${sectionLabel(s).padEnd(secW)}~${formatNumber(s.tokens)}  (${pctOf(s.tokens, d.systemPrompt.total)})`);
       if (s.name === "project_context" && d.contextFiles.length > 0) {
-        for (const f of d.contextFiles) addL(`    ${f.path.padEnd(16)}~${formatNumber(f.tokens)}`, "dim");
+        for (const f of d.contextFiles) addL(`    ${f.path.padEnd(fileW)}~${formatNumber(f.tokens)}`, "dim");
       }
     }
   }
@@ -826,8 +1354,9 @@ export function buildStatsColumns(d: StatsData, leftWidth: number, rightWidth: n
   if (d.messages.roles.length === 0) {
     addL("  (none)", "dim");
   } else {
+    const roleW = columnWidth(d.messages.roles.map((r) => r.role), 18);
     for (const r of d.messages.roles) {
-      addL(`  ${r.role.padEnd(18)}${String(r.count).padStart(4)}  ~${formatNumber(r.tokens)}`, "dim");
+      addL(`  ${r.role.padEnd(roleW)}${String(r.count).padStart(4)}  ~${formatNumber(r.tokens)}`, "dim");
     }
   }
   addL("", "default");
@@ -845,28 +1374,66 @@ export function buildStatsColumns(d: StatsData, leftWidth: number, rightWidth: n
   }
   addL("", "default");
 
+  // ------------------------------------------------- changes (git, this session)
+  addL("changes (this session, git)", "accent");
+  const git = d.git;
+  if (git === undefined) {
+    addL("  …", "dim"); // probe still running — section fills in on the next frame
+  } else if (git.kind === "not-repo") {
+    addL("  (not a git repo)", "dim");
+  } else if (git.kind === "unavailable") {
+    addL("  (git unavailable)", "dim");
+  } else {
+    const c = git.changes;
+    addL(`  +${formatNumber(c.added)}  -${formatNumber(c.deleted)}  · ${c.files} file${c.files === 1 ? "" : "s"}`);
+    if (c.untracked.files > 0) {
+      addL(`  +${formatNumber(c.untracked.added)} untracked (${c.untracked.files} file${c.untracked.files === 1 ? "" : "s"})`, "dim");
+    }
+    if (c.top.length > 0) {
+      const top = c.top
+        .slice(0, 2)
+        .map((f) => `${f.path} +${formatNumber(f.added)}${f.deleted > 0 ? ` -${formatNumber(f.deleted)}` : ""}`)
+        .join(" · ");
+      addL(`  top: ${top}`, "dim");
+    }
+  }
+  addL("", "default");
+
   addL("performance (output tokens/s)", "accent");
-  const perfLine = (label: string, w: PerfWindow): void => {
+  const perfLabels = ["session", "last 10", "last 100"];
+  if (d.performance.last) perfLabels.push("last turn");
+  if (d.mtp) perfLabels.push("mtp (lm studio)");
+  const perfW = columnWidth(perfLabels, 10);
+  const perfLine = (label: string, w: PerfWindow, suffix = `${w.count} turns`): void => {
     if (w.count === 0) {
-      addL(`  ${label.padEnd(10)}—  (no data)`, "dim");
+      addL(`  ${label.padEnd(perfW)}—  (no data)`, "dim");
       return;
     }
     const tps = w.tps == null ? "—" : `${w.tps.toFixed(1)} tok/s`;
     addL(
-      `  ${label.padEnd(10)}${tps.padEnd(13)}· ${formatNumber(w.tokens)} out / ${formatDuration(w.seconds)} (${w.count} turns)`,
+      `  ${label.padEnd(perfW)}${tps.padEnd(13)}· ${formatNumber(w.tokens)} out / ${formatDuration(w.seconds)} (${suffix})`,
       "dim",
     );
   };
   perfLine("session", d.performance.session);
   perfLine("last 10", d.performance.last10);
   perfLine("last 100", d.performance.last100);
+  if (d.performance.last) perfLine("last turn", d.performance.last, "last");
+  if (d.mtp) {
+    const m = d.mtp;
+    addL(
+      `  ${"mtp (lm studio)".padEnd(perfW)}${"—".padEnd(13)}· ${m.accepted}/${m.total} drafts (${Math.round(m.rate * 100)}% accepted)`,
+      "dim",
+    );
+  }
 
   // --------------------------------------------------- RIGHT: environment
   addR("environment", "accent");
   addR("loaded resources", "accent");
+  const resW = columnWidth(["context", "skills", "prompts", "extensions"], 12);
   const resLine = (label: string, items: string[]): void => {
     const body = items.length > 0 ? items.join(", ") : "(none)";
-    for (const line of wrapped(`  ${label.padEnd(12)}`, body, rightWidth)) addR(line, "dim");
+    for (const line of wrapped(`  ${label.padEnd(resW)}`, body, rightWidth)) addR(line, "dim");
   };
   resLine("context", d.resources.contextFiles.map((r) => r.name));
   resLine("skills", d.resources.skills.map((r) => r.name));
@@ -886,17 +1453,44 @@ export function buildStatsColumns(d: StatsData, leftWidth: number, rightWidth: n
   if (d.usage.skills.length === 0 && d.usage.extensions.length === 0 && d.usage.tools.length === 0) {
     addR("  (none)", "dim");
   } else {
+    const usageW = columnWidth(
+      [...d.usage.skills, ...d.usage.extensions, ...d.usage.tools].map((it) => it.name),
+      14,
+    );
+    const countW = Math.max(
+      4,
+      ...[...d.usage.skills, ...d.usage.extensions, ...d.usage.tools].map((it) => String(it.count).length),
+    );
     const usageBlock = (title: string, items: UsageItem[], singular: string, plural: string): void => {
       if (items.length === 0) return;
       addR(`  ${title}`, "dim");
       for (const it of items) {
         const unit = it.count === 1 ? singular : plural;
-        addR(`    ${it.name.padEnd(14)}${String(it.count).padStart(4)} ${unit}  added ${it.added ?? "?"}`, "dim");
+        addR(
+          `    ${it.name.padEnd(usageW)}${String(it.count).padStart(countW)} ${unit.padEnd(4)} added ${it.added ?? "?"}`,
+          "dim",
+        );
       }
     };
     usageBlock("skills", d.usage.skills, "use", "uses");
     usageBlock("extensions", d.usage.extensions, "run", "runs");
     usageBlock("tools", d.usage.tools, "run", "runs");
+  }
+
+  if (d.ratings && (d.ratings.extensions.length > 0 || d.ratings.tools.length > 0)) {
+    addR("perf rating (1 cheap · 5 costly)", "accent");
+    const rated = [...d.ratings.extensions, ...d.ratings.tools].sort(
+      (a, b) => b.rating - a.rating || a.name.localeCompare(b.name),
+    );
+    const rateW = columnWidth(rated.map((r) => r.name), 14);
+    const callsFmt = rated.map((r) => formatNumber(r.calls));
+    const callsW = Math.max(4, ...callsFmt.map((s) => s.length));
+    for (let i = 0; i < rated.length; i++) {
+      const r = rated[i];
+      const ms = r.avgMs != null ? `  · avg ${formatMs(r.avgMs)}/call` : "";
+      addR(`  ${r.name.padEnd(rateW)}${r.rating} ${callsFmt[i].padStart(callsW)} runs${ms}`, "dim");
+    }
+    addR("", "default");
   }
 
   const footer: StatsLine = { text: "esc/q close · ↑↓/pgup/pgdn/wheel scroll · r refresh · updates live", color: "dim" };
@@ -1156,6 +1750,7 @@ export function collectStats(pi: ResourcesLike, ctx: StatsContextLike, opts: Col
     tools: parseToolList(sectionTexts["tools"]),
   };
   const usageData = new UsageStore(opts.usageStorePath).snapshot();
+  const perfData = new PerfStore(opts.perfStorePath).snapshot();
   const addedFor = (resolved: string | undefined): string | null =>
     resolved ? formatAddedDate(fileIntroducedDate(resolved)) : null;
   const usage: UsageSection = {
@@ -1170,6 +1765,31 @@ export function collectStats(pi: ResourcesLike, ctx: StatsContextLike, opts: Col
       .sort((a, b) => b.count - a.count || a.name.localeCompare(b.name)),
   };
   const performance = perfStats(extractWorkItems(entries));
+
+  // v1.5: composite perf rating per loaded extension (static source metrics +
+  // run count) and per loaded tool (measured durations + run count + impl size)
+  const ratings: RatingsSection = { extensions: [], tools: [] };
+  for (const e of resources.extensions) {
+    const statics = extensionStaticMetrics(e.resolved ?? e.path);
+    const calls = usageData.extensions[e.resolved ?? e.path]?.count ?? 0;
+    const r = rateItem({
+      kind: "extension",
+      name: e.name,
+      calls,
+      avgMs: null,
+      bytes: statics?.bytes ?? null,
+      subscriptions: statics?.subs ?? 0,
+      tuiPerFrame: statics?.tui ?? false,
+    });
+    ratings.extensions.push({ name: r.name, rating: r.rating, avgMs: r.avgMs, calls: r.calls });
+  }
+  for (const t of resources.tools) {
+    const rec = perfData.tools[t];
+    const calls = Math.max(usageData.tools[t]?.count ?? 0, rec?.calls ?? 0);
+    const avgMs = rec && rec.calls > 0 ? rec.totalMs / rec.calls : null;
+    const r = rateItem({ kind: "tool", name: t, calls, avgMs, bytes: toolImplBytes(t) });
+    ratings.tools.push({ name: r.name, rating: r.rating, avgMs: r.avgMs, calls: r.calls });
+  }
 
   return {
     model: ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : "unknown",
@@ -1191,6 +1811,7 @@ export function collectStats(pi: ResourcesLike, ctx: StatsContextLike, opts: Col
     resources,
     usage,
     performance,
+    ratings,
   };
 }
 
@@ -1406,13 +2027,36 @@ export default function (pi: ExtensionAPI): void {
     const name = attributeSkillInput(event.text);
     if (name) trackSkillUse(name);
   });
+  // v1.5: per-call wall clock for the perf store (fallback when pi does not
+  // report durationMs; pruned so a missing end event can't leak forever)
+  const toolStartTimes = new Map<string, number>();
   pi.on("tool_execution_start", (event) => {
     trackToolUse(event.toolName);
+    if (toolStartTimes.size > 2000) toolStartTimes.clear();
+    toolStartTimes.set(event.toolCallId, Date.now());
     const name = skillUseFromRead(event.toolName, event.args, skillIndexNow());
     if (name) trackSkillUse(name);
   });
+  pi.on("tool_execution_end", (event) => {
+    const startAt = toolStartTimes.get(event.toolCallId);
+    toolStartTimes.delete(event.toolCallId);
+    let ms = typeof event.durationMs === "number" ? event.durationMs : NaN;
+    if (!Number.isFinite(ms) || ms <= 0) ms = startAt != null ? Math.max(1, Date.now() - startAt) : NaN;
+    if (Number.isFinite(ms) && ms > 0) {
+      try {
+        new PerfStore().record(event.toolName, ms);
+      } catch {
+        // counters must never break tool execution
+      }
+    }
+  });
   pi.on("session_start", invalidateSkillIndex);
-  pi.on("resources_discover", invalidateSkillIndex);
+  pi.on("resources_discover", (event) => {
+    invalidateSkillIndex();
+    // v1.4: session-start baseline for the changes section (fires with cwd at
+    // startup/reload, i.e. session start); in-memory only, never persisted.
+    void captureGitBaseline(event.cwd);
+  });
 
   pi.registerCommand("stats", {
     description: "Open the live session stats dashboard (overlay; works while the agent is running)",
@@ -1433,15 +2077,57 @@ export default function (pi: ExtensionAPI): void {
 
       let comp: StatsDashboard | undefined;
       let lastRefreshAt = 0;
+      // v1.4: git changes arrive asynchronously (first frame renders immediately,
+      // the section fills in when the probe answers). The 2 s TTL cache inside
+      // collectGitChanges keeps live refreshes from re-spawning git.
+      let lastData: StatsData = data;
+      let gitProbeInFlight = false;
+      const applyGit = (git: GitChangesResult): void => {
+        if (git === lastData.git) return;
+        lastData = { ...lastData, git };
+        comp?.setData(lastData);
+      };
+      const updateGit = (): void => {
+        if (gitProbeInFlight) return;
+        gitProbeInFlight = true;
+        const baseline = currentGitBaseline();
+        void collectGitChanges(ctx.cwd, baseline?.cwd === ctx.cwd ? baseline.head : null)
+          .then((git) => {
+            gitProbeInFlight = false;
+            applyGit(git);
+          })
+          .catch(() => {
+            gitProbeInFlight = false;
+          });
+      };
+      // v1.5: MTP acceptance rate — one tiny LM Studio completion (60 s
+      // in-process cache); only for the lmstudio provider; never blocks the UI.
+      let mtpTried = false;
+      const updateMtp = (): void => {
+        if (mtpTried || ctx.model?.provider !== "lmstudio" || !ctx.model?.id) return;
+        mtpTried = true;
+        void probeMtpAcceptance(ctx.model.id)
+          .then((mtp) => {
+            if (mtp && mtp !== lastData.mtp) {
+              lastData = { ...lastData, mtp };
+              comp?.setData(lastData);
+            }
+          })
+          .catch(() => {});
+      };
+
       const refresh = (): void => {
         const now = Date.now();
         if (now - lastRefreshAt < REFRESH_THROTTLE_MS) return;
         lastRefreshAt = now;
         try {
-          comp?.setData(collectStats(pi, ctx));
+          lastData = { ...collectStats(pi, ctx), git: lastData.git, mtp: lastData.mtp };
+          comp?.setData(lastData);
         } catch {
           // keep the last good frame
         }
+        updateGit();
+        updateMtp();
       };
 
       // Live updates while the overlay is open (unsubscribed in finally).
@@ -1459,6 +2145,8 @@ export default function (pi: ExtensionAPI): void {
         await ctx.ui.custom<undefined>(
           (tui, theme, keybindings, done) => {
             comp = new StatsDashboard(theme, tui, keybindings, data, () => done(undefined), refresh);
+            updateGit(); // kick the probe now so the section fills in right away
+            updateMtp(); // same: MTP row fills in without blocking the first frame
             return comp;
           },
           {

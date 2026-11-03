@@ -1,0 +1,167 @@
+{
+  "generatedAt": "2026-11-03T12:20:05.803Z",
+  "scale": "1 (cheapest) … 5 (most costly)",
+  "weights": {
+    "duration": 0.5,
+    "frequency": 0.3,
+    "static": 0.2
+  },
+  "bands": {
+    "durationMs": [
+      50,
+      200,
+      1000,
+      10000
+    ],
+    "calls": [
+      10,
+      100,
+      1000,
+      10000
+    ],
+    "bytes": [
+      2048,
+      8192,
+      32768,
+      102400
+    ],
+    "subscriptions": [
+      2,
+      4,
+      6,
+      10
+    ]
+  },
+  "sources": {
+    "perf": "/home/julian/.pi/agent/perf-stats.json",
+    "usage": "/home/julian/.pi/agent/usage-stats.json"
+  },
+  "items": [
+    {
+      "name": "bash",
+      "kind": "tool",
+      "rating": 2,
+      "duration": 1,
+      "frequency": 2,
+      "static": 3,
+      "calls": 23,
+      "avgMs": null,
+      "maxMs": null,
+      "bytes": 15703
+    },
+    {
+      "name": "edit",
+      "kind": "tool",
+      "rating": 2,
+      "duration": 1,
+      "frequency": 2,
+      "static": 2,
+      "calls": 11,
+      "avgMs": null,
+      "maxMs": null,
+      "bytes": 7455
+    },
+    {
+      "name": "read",
+      "kind": "tool",
+      "rating": 2,
+      "duration": 1,
+      "frequency": 2,
+      "static": 3,
+      "calls": 11,
+      "avgMs": null,
+      "maxMs": null,
+      "bytes": 11254
+    },
+    {
+      "name": "stats.ts",
+      "kind": "extension",
+      "rating": 2,
+      "duration": 1,
+      "frequency": 1,
+      "static": 5,
+      "calls": 8,
+      "avgMs": null,
+      "bytes": 78748,
+      "subscriptions": 13,
+      "tuiPerFrame": false
+    },
+    {
+      "name": "token-counter.ts",
+      "kind": "extension",
+      "rating": 2,
+      "duration": 1,
+      "frequency": 1,
+      "static": 4,
+      "calls": 0,
+      "avgMs": null,
+      "bytes": 12569,
+      "subscriptions": 6,
+      "tuiPerFrame": false
+    },
+    {
+      "name": "lmstudio.ts",
+      "kind": "extension",
+      "rating": 1,
+      "duration": 1,
+      "frequency": 1,
+      "static": 2,
+      "calls": 0,
+      "avgMs": null,
+      "bytes": 7312,
+      "subscriptions": 0,
+      "tuiPerFrame": false
+    },
+    {
+      "name": "notify-on-settle.ts",
+      "kind": "extension",
+      "rating": 1,
+      "duration": 1,
+      "frequency": 1,
+      "static": 1,
+      "calls": 2,
+      "avgMs": null,
+      "bytes": 1991,
+      "subscriptions": 1,
+      "tuiPerFrame": false
+    },
+    {
+      "name": "reload-resources.ts",
+      "kind": "extension",
+      "rating": 1,
+      "duration": 1,
+      "frequency": 1,
+      "static": 3,
+      "calls": 3,
+      "avgMs": null,
+      "bytes": 15976,
+      "subscriptions": 1,
+      "tuiPerFrame": false
+    },
+    {
+      "name": "session-name-border.ts",
+      "kind": "extension",
+      "rating": 1,
+      "duration": 1,
+      "frequency": 1,
+      "static": 2,
+      "calls": 6,
+      "avgMs": null,
+      "bytes": 4056,
+      "subscriptions": 1,
+      "tuiPerFrame": false
+    },
+    {
+      "name": "write",
+      "kind": "tool",
+      "rating": 1,
+      "duration": 1,
+      "frequency": 1,
+      "static": 2,
+      "calls": 2,
+      "avgMs": null,
+      "maxMs": null,
+      "bytes": 2990
+    }
+  ]
+}

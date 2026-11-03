@@ -16,6 +16,7 @@ import statsExt, {
   type StatsContextLike,
   type StatsData,
   StatsDashboard,
+  PerfStore,
   UsageStore,
   attributeSkillInput,
   bar,
@@ -23,6 +24,7 @@ import statsExt, {
   buildStatsLines,
   clampScroll,
   collectLoadedResources,
+  columnWidth,
   collectStats,
   extractWorkItems,
   fileIntroducedDate,
@@ -30,10 +32,16 @@ import statsExt, {
   formatCost,
   formatDuration,
   formatNumber,
+  lastTurnWindow,
+  parseMtpStats,
+  parseNumstat,
   parseSystemPromptSections,
   parseToolList,
+  parseUntrackedWc,
   perfStats,
+  rateItem,
   roleBreakdown,
+  staticSourceMetrics,
   sectionStats,
   skillUseFromRead,
   sumSessionUsage,
@@ -1067,6 +1075,80 @@ test("parseToolList: parses - name: description lines", () => {
   assert.deepEqual(parseToolList("   "), []);
 });
 
+test("parseNumstat: added/deleted lines, files, binary, renames; top sorted", () => {
+  const out = "10\t2\tfile.ts\n0\t12\tgone.txt\n-\t-\tbinary.png\n5\t0\ta => b.md\n";
+  const r = parseNumstat(out);
+  assert.equal(r.added, 15);
+  assert.equal(r.deleted, 14);
+  assert.equal(r.files, 4);
+  // top sorted by (added+deleted) desc, tie-break added desc: file.ts(12,10+) then gone.txt(12,0+)
+  assert.deepEqual(r.top.map((f) => f.path), ["file.ts", "gone.txt", "a => b.md", "binary.png"]);
+  assert.deepEqual(r.top[0], { path: "file.ts", added: 10, deleted: 2 });
+  // binary: counted as a file, zero lines
+  assert.deepEqual(r.top[3], { path: "binary.png", added: 0, deleted: 0 });
+  assert.deepEqual(parseNumstat(""), { added: 0, deleted: 0, files: 0, top: [] });
+});
+
+test("parseUntrackedWc: sums lines, skips total lines (incl. xargs-splits)", () => {
+  assert.deepEqual(parseUntrackedWc("      7 new.txt\n      3 other.md\n      10 total\n"), { files: 2, added: 10 });
+  // xargs may spawn multiple wc processes → multiple `total` lines
+  assert.deepEqual(parseUntrackedWc("      1 a\n      1 total\n      2 b\n      2 total\n"), { files: 2, added: 3 });
+  assert.deepEqual(parseUntrackedWc(""), { files: 0, added: 0 });
+});
+
+test("buildStatsColumns: changes section (changes / not-repo / unavailable / pending)", () => {
+  // pending: no git field yet → header + … (the probe fills in on the next frame)
+  const pending = buildStatsColumns(dashboardData(), 40, 40);
+  const ptext = pending.left.map((l) => l.text);
+  const pidx = ptext.findIndex((t) => t.startsWith("changes (this session, git)"));
+  assert.ok(pidx >= 0, "pending: header shown while loading");
+  assert.equal(ptext[pidx + 1], "  …");
+
+  const withGit: StatsData = {
+    ...dashboardData(),
+    git: {
+      kind: "changes",
+      changes: {
+        added: 12,
+        deleted: 3,
+        files: 1,
+        untracked: { files: 3, added: 89 },
+        top: [
+          { path: "stats.ts", added: 40, deleted: 2 },
+          { path: "README.md", added: 15, deleted: 0 },
+        ],
+      },
+    },
+  };
+  const cols = buildStatsColumns(withGit, 40, 40);
+  const text = cols.left.map((l) => l.text);
+  const idx = text.findIndex((t) => t.startsWith("changes (this session, git)"));
+  assert.ok(idx >= 0, "changes header missing");
+  assert.equal(text[idx + 1], "  +12  -3  · 1 file");
+  assert.equal(text[idx + 2], "  +89 untracked (3 files)");
+  assert.equal(text[idx + 3], "  top: stats.ts +40 -2 · README.md +15");
+  // ordered between tokens and performance
+  assert.ok(text.indexOf("tokens (session)") < idx);
+  assert.ok(idx < text.indexOf("performance (output tokens/s)"));
+
+  const notRepo = buildStatsColumns({ ...dashboardData(), git: { kind: "not-repo" } }, 40, 40);
+  assert.ok(notRepo.left.some((l) => l.text === "  (not a git repo)"));
+
+  const unavailable = buildStatsColumns({ ...dashboardData(), git: { kind: "unavailable", reason: "timeout" } }, 40, 40);
+  assert.ok(unavailable.left.some((l) => l.text === "  (git unavailable)"));
+
+  // zero changes: main line only (no untracked/top lines)
+  const zero: StatsData = {
+    ...dashboardData(),
+    git: { kind: "changes", changes: { added: 0, deleted: 0, files: 0, untracked: { files: 0, added: 0 }, top: [] } },
+  };
+  const zcols = buildStatsColumns(zero, 40, 40);
+  const ztext = zcols.left.map((l) => l.text);
+  const zidx = ztext.findIndex((t) => t.startsWith("changes (this session, git)"));
+  assert.equal(ztext[zidx + 1], "  +0  -0  · 0 files");
+  assert.equal(ztext[zidx + 2], "");
+});
+
 test("UsageStore: tool counters persist; old files migrate", () => {
   const dir = makeTmp("toolstore");
   const file = path.join(dir, "usage-stats.json");
@@ -1352,6 +1434,323 @@ test("StatsDashboard: live data refresh re-renders", () => {
   assert.ok(after.includes("other/newmodel"));
   comp.handleInput?.("r"); // manual refresh key does not throw
   comp.dispose?.();
+});
+
+// ====================== v1.5: last turn · MTP acceptance · perf rating ======================
+
+test("lastTurnWindow: single most recent item vs the one before it", () => {
+  const items = [
+    { tokens: 100, timestamp: 0 },
+    { tokens: 200, timestamp: 10_000 },
+    { tokens: 300, timestamp: 30_000 },
+  ];
+  const last = lastTurnWindow(items);
+  assert.equal(last.count, 1);
+  assert.equal(last.tokens, 300);
+  assert.equal(last.seconds, 20);
+  assert.equal(last.tps, 15);
+  const single = lastTurnWindow([{ tokens: 77, timestamp: 5 }]);
+  assert.equal(single.count, 1);
+  assert.equal(single.tokens, 77);
+  assert.equal(single.seconds, 0);
+  assert.equal(single.tps, null);
+  const zeroSpan = lastTurnWindow([
+    { tokens: 10, timestamp: 5 },
+    { tokens: 20, timestamp: 5 },
+  ]);
+  assert.equal(zeroSpan.tps, null);
+});
+
+test("parseMtpStats: LM Studio draft-token (MTP) stats", () => {
+  const body = {
+    usage: { prompt_tokens: 61, completion_tokens: 108 },
+    stats: {
+      total_draft_tokens_count: 92,
+      accepted_draft_tokens_count: 85,
+      rejected_draft_tokens_count: 7,
+      ignored_draft_tokens_count: 0,
+    },
+  };
+  const m = parseMtpStats(body);
+  assert.ok(m, "parses the stats object");
+  assert.equal(m?.total, 92);
+  assert.equal(m?.accepted, 85);
+  assert.equal(m?.rejected, 7);
+  assert.ok(Math.abs(m!.rate - 85 / 92) < 1e-9, "rate = accepted/total");
+  assert.equal(parseMtpStats({ stats: {} }), null, "empty stats (1-token answer) → null");
+  assert.equal(parseMtpStats({}), null, "missing stats → null");
+  assert.equal(parseMtpStats("nope"), null, "non-object body → null");
+  assert.equal(parseMtpStats({ stats: { total_draft_tokens_count: 0 } }), null, "total 0 → null");
+});
+
+test("PerfStore: tool durations persist, max tracked, invalid skipped, corrupt recovers", () => {
+  const dir = makeTmp("perfstore");
+  const file = path.join(dir, "perf-stats.json");
+  const s = new PerfStore(file);
+  const d1 = s.record("bash", 120);
+  assert.equal(d1.tools.bash?.calls, 1);
+  assert.equal(d1.tools.bash?.totalMs, 120);
+  assert.equal(d1.tools.bash?.maxMs, 120);
+  assert.ok(d1.tools.bash?.firstSeen && d1.tools.bash?.lastUsed, "timestamps set");
+  const d2 = s.record("bash", 30);
+  assert.equal(d2.tools.bash?.calls, 2);
+  assert.equal(d2.tools.bash?.totalMs, 150);
+  assert.equal(d2.tools.bash?.maxMs, 120, "max survives a smaller record");
+  s.record("bash", -5);
+  s.record("bash", Number.NaN);
+  assert.equal(new PerfStore(file).snapshot().tools.bash?.calls, 2, "invalid durations not recorded");
+  fs.writeFileSync(file, "{not json");
+  assert.deepEqual(new PerfStore(file).snapshot(), { version: 1, tools: {} }, "corrupt → fresh");
+  assert.equal(new PerfStore(file).avgMs("bash"), null);
+});
+
+test("staticSourceMetrics: bytes, pi.on count, per-frame TUI detection", () => {
+  const src = 'import x from "y";\npi.on("a", h);\npi.on("b", h);\npi.on("c", h);\nctx.ui.custom(comp);\n';
+  const m = staticSourceMetrics(src);
+  assert.equal(m.subs, 3);
+  assert.equal(m.tui, true);
+  assert.equal(m.bytes, Buffer.byteLength(src));
+  const plain = staticSourceMetrics('pi.registerCommand("c", {});\n');
+  assert.equal(plain.subs, 0);
+  assert.equal(plain.tui, false);
+  assert.equal(staticSourceMetrics("tui.showOverlay(c);").tui, true);
+  assert.equal(staticSourceMetrics("pi.registerComponent(c);").tui, true);
+});
+
+test("rateItem: deterministic 1–5 bands and weighted composite", () => {
+  // cheapest possible extension: no measurements, tiny, one subscription
+  const cheap = rateItem({ kind: "extension", name: "cheap.ts", calls: 0, avgMs: null, bytes: 1000, subscriptions: 1 });
+  assert.equal(cheap.rating, 1);
+  assert.deepEqual([cheap.duration, cheap.frequency, cheap.static], [1, 1, 1]);
+
+  // heavy tool: 2.5 s/call, 1.5k calls, 30 KB impl
+  const heavy = rateItem({ kind: "tool", name: "bash", calls: 1500, avgMs: 2500, bytes: 30_000 });
+  assert.equal(heavy.rating, 4);
+  assert.deepEqual([heavy.duration, heavy.frequency, heavy.static], [4, 4, 3]);
+
+  // per-frame TUI extension bumps the static factor by one
+  const ui = rateItem({ kind: "extension", name: "ui.ts", calls: 50, avgMs: 80, bytes: 4_000, subscriptions: 4, tuiPerFrame: true });
+  assert.equal(ui.static, 4, "max(size=2, subs=3) + 1 for per-frame TUI");
+  assert.equal(ui.rating, 2);
+
+  // ceiling
+  const max = rateItem({ kind: "tool", name: "x", calls: 50_000, avgMs: 60_000, bytes: 200_000 });
+  assert.equal(max.rating, 5);
+  assert.deepEqual([max.duration, max.frequency, max.static], [5, 5, 5]);
+
+  // unknown bytes (dynamic/MCP tool, no impl file) → neutral static 3
+  const unknown = rateItem({ kind: "tool", name: "mcp-tool", calls: 0, avgMs: null, bytes: null });
+  assert.equal(unknown.static, 3);
+});
+
+test("buildStatsColumns: performance section shows last turn + mtp rows", () => {
+  const d = dashboardData();
+  d.performance.last = { count: 1, tokens: 300, seconds: 20, tps: 15 };
+  d.mtp = { total: 123, accepted: 96, rejected: 27, ignored: 0, rate: 96 / 123 };
+  const left = buildStatsColumns(d, 40, 40).left.map((l) => l.text);
+  // NOTE: the session section also has a "last turn" token line — match the perf one
+  const idx = left.findIndex((t) => t.startsWith("  last turn") && t.includes("tok/s"));
+  assert.ok(idx > 0, "last turn perf row present");
+  assert.ok(left[idx].includes("15.0 tok/s"), left[idx]);
+  assert.ok(left[idx].includes("300 out"), left[idx]);
+  const mtpIdx = left.findIndex((t) => t.startsWith("  mtp (lm studio)"));
+  assert.ok(mtpIdx > idx, "mtp row after last turn");
+  assert.ok(left[mtpIdx].includes("78%"), left[mtpIdx]);
+  assert.ok(left[mtpIdx].includes("96/123"), left[mtpIdx]);
+
+  // no data → rows absent
+  const left2 = buildStatsColumns(dashboardData(), 40, 40).left.map((l) => l.text);
+  assert.ok(!left2.some((t) => t.startsWith("  last turn") && t.includes("tok/s")), "no last turn perf row without data");
+  assert.ok(!left2.some((t) => t.startsWith("  mtp (lm studio)")), "no mtp without data");
+});
+
+test("buildStatsColumns: perf rating section in RIGHT column", () => {
+  const d = dashboardData();
+  d.ratings = {
+    extensions: [{ name: "stats.ts", rating: 2, avgMs: null, calls: 7 }],
+    tools: [
+      { name: "bash", rating: 4, avgMs: 2500, calls: 1500 },
+      { name: "read", rating: 1, avgMs: null, calls: 42 },
+    ],
+  };
+  const right = buildStatsColumns(d, 40, 40).right.map((l) => l.text);
+  const idx = right.findIndex((t) => t.startsWith("perf rating"));
+  assert.ok(idx > 0, "perf rating header");
+  const after = right.slice(idx);
+  const bashRel = after.findIndex((t) => t.includes("bash"));
+  assert.ok(bashRel >= 0, "bash listed under perf rating");
+  assert.ok(after[bashRel].includes("4"), after[bashRel]);
+  assert.ok(after[bashRel].includes("2.5s"), "avg ms formatted: " + after[bashRel]);
+  const readRel = after.findIndex((t) => t.includes("read"));
+  assert.ok(readRel > 0, "read listed");
+  assert.ok(!after[readRel].includes("/call"), "no /call suffix without duration data: " + after[readRel]);
+
+  // no ratings data → no section
+  const right2 = buildStatsColumns(dashboardData(), 40, 40).right.map((l) => l.text);
+  assert.ok(!right2.some((t) => t.startsWith("perf rating")), "no perf rating without data");
+});
+
+test("factory: tool_execution_end records durations in the perf store", () => {
+  const prevUsage = process.env.PI_STATS_USAGE_FILE;
+  const prevPerf = process.env.PI_STATS_PERF_FILE;
+  const dir = makeTmp("factory-perf");
+  process.env.PI_STATS_USAGE_FILE = path.join(dir, "usage.json");
+  const perfFile = path.join(dir, "perf-stats.json");
+  process.env.PI_STATS_PERF_FILE = perfFile;
+  const handlers = new Map<string, unknown[]>();
+  try {
+    statsExt({
+      registerCommand: () => {},
+      on: (event: string, handler: unknown) => {
+        const list = handlers.get(event) ?? [];
+        list.push(handler);
+        handlers.set(event, list);
+        return () => {};
+      },
+    } as never);
+    const fire = (event: string, payload: unknown): void => {
+      for (const h of handlers.get(event) ?? []) (h as (e: unknown) => void)(payload);
+    };
+    fire("tool_execution_start", { type: "tool_execution_start", toolCallId: "c1", toolName: "bash", args: { command: "ls" } });
+    fire("tool_execution_end", { type: "tool_execution_end", toolCallId: "c1", toolName: "bash", result: null, isError: false, durationMs: 250 });
+    fire("tool_execution_start", { type: "tool_execution_start", toolCallId: "c2", toolName: "read", args: { path: "/x" } });
+    // no durationMs → wall-clock fallback (≥1 ms, sub-millisecond floor)
+    fire("tool_execution_end", { type: "tool_execution_end", toolCallId: "c2", toolName: "read", result: null, isError: false });
+    // orphan end without durationMs → not recorded
+    fire("tool_execution_end", { type: "tool_execution_end", toolCallId: "zz", toolName: "write", result: null, isError: false });
+    const d = JSON.parse(fs.readFileSync(perfFile, "utf-8"));
+    assert.equal(d.tools.bash?.calls, 1);
+    assert.equal(d.tools.bash?.totalMs, 250);
+    assert.equal(d.tools.bash?.maxMs, 250);
+    assert.equal(d.tools.read?.calls, 1, "wall-clock fallback recorded");
+    assert.ok((d.tools.read?.totalMs ?? 0) >= 1, "fallback floored at 1 ms");
+    assert.equal(d.tools.write, undefined, "orphan end without durationMs not recorded");
+  } finally {
+    if (prevUsage === undefined) delete process.env.PI_STATS_USAGE_FILE;
+    else process.env.PI_STATS_USAGE_FILE = prevUsage;
+    if (prevPerf === undefined) delete process.env.PI_STATS_PERF_FILE;
+    else process.env.PI_STATS_PERF_FILE = prevPerf;
+  }
+});
+
+/* ------------------------------------------------------------------- */
+/* v1.5.1 — table column alignment (first column width is dynamic)      */
+/* ------------------------------------------------------------------- */
+
+test("columnWidth: min when labels are short, longest+gap when long", () => {
+  assert.equal(columnWidth([]), 14);
+  assert.equal(columnWidth(["bash", "read", "write"]), 14);
+  assert.equal(columnWidth(["session-name-border.ts"]), 24); // 22 + 2
+  assert.equal(columnWidth(["session", "last 100"], 10), 10);
+  assert.equal(columnWidth(["mtp (lm studio)"], 10), 17); // 15 + 2
+});
+
+/** every line must contain `marker` at the SAME index (column alignment) */
+function assertAligned(lines: string[], marker: string, label: string): void {
+  assert.ok(lines.length >= 2, `${label}: need >=2 lines, got ${lines.length}`);
+  const idx = lines.map((l) => l.indexOf(marker));
+  assert.ok(
+    idx.every((i) => i >= 0),
+    `${label}: every line must contain "${marker}":\n` + lines.map((l, i) => `  [${i}] ${l}`).join("\n"),
+  );
+  assert.ok(
+    new Set(idx).size === 1,
+    `${label}: "${marker}" must start at the same index on every row:\n` +
+      lines.map((l, i) => `  [${i}] idx=${idx[i]}  ${l}`).join("\n"),
+  );
+}
+
+test("buildStatsColumns: usage table stays aligned with long names", () => {
+  const d = dashboardData();
+  d.usage.skills = [
+    { name: "very-long-skill-name-aaaaaaaaaa", count: 3, added: "2026-01-01" },
+    { name: "tiny", count: 1, added: "2026-01-02" },
+  ];
+  d.usage.extensions = [{ name: "session-name-border.ts", count: 6, added: "2026-01-03" }];
+  d.usage.tools = [
+    { name: "mcp__context7__resolve-library-id", count: 42, added: "2026-01-04" },
+    { name: "bash", count: 9, added: "2026-01-05" },
+  ];
+  const right = buildStatsColumns(d, 60, 120).right.map((l) => l.text);
+  const start = right.indexOf("usage (global · all sessions)");
+  assert.ok(start >= 0, "usage header present");
+  const rows = right.slice(start + 1).filter((l) => l.includes("added "));
+  assert.ok(rows.length >= 5, "usage rows present: " + rows.join(" | "));
+  assertAligned(rows, "added ", "usage table");
+});
+
+test("buildStatsColumns: perf rating table stays aligned with long names", () => {
+  const d = dashboardData();
+  d.ratings = {
+    extensions: [
+      { name: "session-name-border.ts", rating: 2, avgMs: null, calls: 6 },
+      { name: "stats.ts", rating: 2, avgMs: null, calls: 7 },
+    ],
+    tools: [
+      { name: "mcp__context7__resolve-library-id", rating: 3, avgMs: 250, calls: 100 },
+      { name: "bash", rating: 4, avgMs: 2500, calls: 1500 },
+    ],
+  };
+  const right = buildStatsColumns(d, 60, 120).right.map((l) => l.text);
+  const start = right.findIndex((t) => t.startsWith("perf rating"));
+  assert.ok(start >= 0, "perf rating header present");
+  const rows = right.slice(start + 1).filter((l) => l.includes("runs"));
+  assert.ok(rows.length >= 4, "rating rows present: " + rows.join(" | "));
+  assertAligned(rows, " runs", "perf rating table");
+});
+
+test("buildStatsColumns: performance table stays aligned incl. the mtp row", () => {
+  const d = dashboardData();
+  d.performance.last = { count: 1, tokens: 300, seconds: 20, tps: 15 };
+  d.performance.last100 = { count: 6, tokens: 500, seconds: 600, tps: 0.8 };
+  d.mtp = { total: 123, accepted: 96, rejected: 27, ignored: 0, rate: 96 / 123 };
+  const left = buildStatsColumns(d, 60, 60).left.map((l) => l.text);
+  const start = left.indexOf("performance (output tokens/s)");
+  assert.ok(start >= 0, "performance header present");
+  const rows: string[] = [];
+  for (let i = start + 1; i < left.length; i++) {
+    if (left[i].trim() === "") break;
+    rows.push(left[i]);
+  }
+  assert.ok(rows.length >= 5, "perf rows (session/10/100/last/mtp) present: " + rows.join(" | "));
+  assertAligned(rows, "· ", "performance table");
+  // mtp row keeps its content
+  const mtp = rows.find((l) => l.includes("mtp (lm studio)"));
+  assert.ok(mtp?.includes("96/123") && mtp?.includes("78%"), "mtp content intact: " + mtp);
+});
+
+test("buildStatsColumns: section + role label tables stay aligned with long labels", () => {
+  const d = dashboardData();
+  d.systemPrompt.sections = [
+    { name: "current_session_info", tokens: 1200, chars: 4800 },
+    { name: "tools", tokens: 800, chars: 3200 },
+  ];
+  d.systemPrompt.total = 2000;
+  d.messages = {
+    count: 12,
+    tokens: 48000,
+    roles: [
+      { role: "compactionSummary", count: 1, tokens: 40000 },
+      { role: "user", count: 4, tokens: 8000 },
+    ],
+  };
+  const left = buildStatsColumns(d, 60, 60).left.map((l) => l.text);
+  const secStart = left.indexOf("system prompt sections");
+  const secRows: string[] = [];
+  for (let i = secStart + 1; i < left.length; i++) {
+    if (left[i].trim() === "") break;
+    secRows.push(left[i]);
+  }
+  assert.ok(secRows.length >= 2, "section rows present: " + secRows.join(" | "));
+  assertAligned(secRows, "~", "system prompt section table");
+  const roleStart = left.indexOf("messages (12)");
+  const roleRows: string[] = [];
+  for (let i = roleStart + 1; i < left.length; i++) {
+    if (left[i].trim() === "") break;
+    roleRows.push(left[i]);
+  }
+  assert.ok(roleRows.length >= 2, "role rows present: " + roleRows.join(" | "));
+  assertAligned(roleRows, "~", "messages role table");
 });
 
 console.log(`\n${passed} tests passed`);

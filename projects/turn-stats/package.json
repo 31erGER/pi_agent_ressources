@@ -1,0 +1,11 @@
+{
+  "name": "turn-stats",
+  "private": true,
+  "type": "module",
+  "description": "Tests + loader check for the turn-stats extension (lives in ~/.pi/agent/extensions/turn-stats.ts)",
+  "scripts": {
+    "test": "node test/turn-stats.test.ts",
+    "loader-check": "node loader-check.mjs",
+    "typecheck": "node /home/julian/.npm/_npx/a322a253dbd59f36/node_modules/typescript/bin/tsc -p tsconfig.json"
+  }
+}

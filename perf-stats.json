@@ -1,0 +1,33 @@
+{
+  "version": 1,
+  "tools": {
+    "read": {
+      "calls": 22,
+      "totalMs": 24,
+      "maxMs": 3,
+      "firstSeen": "2026-11-03T12:47:05.669Z",
+      "lastUsed": "2026-11-03T13:42:41.489Z"
+    },
+    "bash": {
+      "calls": 54,
+      "totalMs": 18987,
+      "maxMs": 4599,
+      "firstSeen": "2026-11-03T12:47:36.628Z",
+      "lastUsed": "2026-11-03T13:43:30.033Z"
+    },
+    "write": {
+      "calls": 8,
+      "totalMs": 9,
+      "maxMs": 2,
+      "firstSeen": "2026-11-03T12:56:37.582Z",
+      "lastUsed": "2026-11-03T13:45:48.052Z"
+    },
+    "edit": {
+      "calls": 14,
+      "totalMs": 36,
+      "maxMs": 8,
+      "firstSeen": "2026-11-03T12:58:35.457Z",
+      "lastUsed": "2026-11-03T13:26:54.860Z"
+    }
+  }
+}
