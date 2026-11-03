@@ -143,8 +143,15 @@ check(
 for (const w of [200, 100, 60, 30]) {
 	const gl = goldenFooter.render(w);
 	const ml = myFooter.render(w);
-	check(`footer @${w}: byte-identical to nameless real footer`, gl.length === ml.length && gl.every((l, i) => l === ml[i]),
+	check(`footer @${w}: nameless real footer minus the pwd line`, gl.length === ml.length + 1 && gl.slice(1).every((l, i) => l === ml[i]),
 		`mine=[${ml.map(strip)}] golden=[${gl.map(strip)}]`);
+}
+
+// the pwd line is gone: my footer's first line is the stats line, no path
+{
+	const ml = myFooter.render(200);
+	check("footer: pwd line removed (no path, starts with stats)", !ml.some((l) => strip(l).includes("~/projects/demo")) && strip(ml[0]).startsWith("↑"),
+		`mine=[${ml.map(strip)}]`);
 }
 
 // live rename: real footer follows, mine does not
@@ -153,11 +160,11 @@ sessionName = "renamed session";
 check("footer: name change does NOT affect custom footer", myFooter.render(200)[0] === before);
 check("footer: real footer DOES follow the rename", strip(realFooter.render(200)[0]).includes(" • renamed session"), strip(realFooter.render(200)[0]));
 
-// nameless: byte-identical to the real (with-name-aware) nameless footer
+// nameless: identical to the real nameless footer minus the pwd line
 sessionName = "";
 const rl = realFooter.render(120);
 const ml = myFooter.render(120);
-check("footer: nameless == real nameless footer (all lines)", rl.length === ml.length && rl.every((l, i) => l === ml[i]));
+check("footer: nameless == real nameless footer minus pwd line", rl.length === ml.length + 1 && rl.slice(1).every((l, i) => l === ml[i]));
 
 // dispose must not throw
 myFooter.dispose();

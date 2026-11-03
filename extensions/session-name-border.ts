@@ -10,17 +10,16 @@
  *     part capped at 70 visible columns; the label is "stuck to the left" —
  *     the beginning is always shown, only the right end gets `...`.
  *
- *  2. FOOTER: the original built-in footer, byte-identical — except the
- *     `• <session name>` suffix is removed from its first (path/branch)
- *     line, because the name is already shown in the top border:
- *         ~/some/path (branch)
+ *  2. FOOTER: the original built-in footer minus its first (path/branch)
+ *     line, which is gone entirely to save a row of UI space — the path
+ *     (and the name) are already shown in the top border:
  *         ↑12.3k ↓1.8k R9.8k W2.3k CH60% $0.12 CTX34%(auto)  model  2providers
  *
  *     Implemented by wrapping pi's real FooterComponent (exported from the
- *     package root) with a session shim that masks
- *     sessionManager.getSessionName() — so the path line, token stats,
- *     context usage, model info and extension-status lines stay in lockstep
- *     with pi's built-in footer (including future pi footer updates).
+ *     package root) with a session shim and dropping its first line (the
+ *     pwd/branch line) — so the token stats, context usage, model info and
+ *     extension-status lines stay byte-identical to pi's built-in footer
+ *     (including future pi footer updates).
  *
  * Pure display: does not touch session files and does not enter the LLM
  * context. Non-TUI modes are unaffected (setEditorComponent / setFooter are
@@ -190,7 +189,11 @@ class NamelessFooter {
 
     render(width: number): string[] {
         try {
-            this.lastLines = this.inner.render(width);
+            const lines = this.inner.render(width);
+            // The real footer's first line is always the pwd/branch line;
+            // the path is already shown in the editor's top border, so drop
+            // it to save a row of UI space (stats + status lines stay).
+            this.lastLines = lines.length > 1 ? lines.slice(1) : lines;
         } catch {
             // keep last good frame
         }

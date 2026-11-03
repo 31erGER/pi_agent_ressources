@@ -11,11 +11,14 @@
 (`~` home-abbreviation, ` • ` separator, same path formatting as the
 original footer).
 
-**v3 (current):** the built-in footer is **overridden in the SAME file**
-so that deleting this single extension file restores pi's original look and
-feel. The footer renders the original built-in footer byte-identical —
-except the `• <session name>` suffix on its first (path/branch) line is
-gone, because the name is already shown in the top border.
+**v3:** the built-in footer is **overridden in the SAME file** so that
+deleting this single extension file restores pi's original look and feel.
+
+**v4 (current):** the footer override now drops the entire first
+(path/branch) line of the built-in footer — not just the ` • name`
+suffix — saving a row of UI space, since the path (and the name) are
+already shown in the top border. The custom footer is the built-in footer
+minus that pwd line, byte-identical on every remaining line.
 
 ## 2. Technical Architecture & Data Flow
 - **Top border (v2, unchanged):** the editor's top border (`lines[0]` of
@@ -34,8 +37,10 @@ gone, because the name is already shown in the top border.
   2. Full label wider than the border budget (`trailing - 3`): re-truncate
      the whole label from the right with `...` (no dots when budget < 4:
      show as much as fits; budget ≤ 0: plain border).
-- **Footer (v3):** `ctx.ui.setFooter(factory)` — the factory wraps pi's
-  **real `FooterComponent`** (root-exported) with a session shim:
+- **Footer (v4):** `ctx.ui.setFooter(factory)` — the factory wraps pi's
+  **real `FooterComponent`** (root-exported) with a session shim and drops
+  the first rendered line (always the pwd/branch line in the built-in
+  component, `lines = [pwdLine, statsLine, ...statusLines]`):
   - shim getters resolve LIVE at call time from `ctx` (pi resolves
     ExtensionContext values at call time — verified in `runner.js
     createContext()`), so model/thinking-level/context-usage changes are
@@ -47,9 +52,9 @@ gone, because the name is already shown in the top border.
     (`render` + `invalidate`) and `dispose`; `render()` is guarded with
     try/catch → on any error it returns the last good frame instead of
     throwing into the TUI render loop.
-  - Consequence: footer line 1 = `~/path (branch)` (no name), lines 2+
-    (token stats, context %, model info, extension status lines) are
-    byte-identical to the built-in footer — golden-tested.
+  - Consequence: the custom footer's line 1 IS the token-stats line
+    (context %, model info); line 2+ are the extension status lines. All
+    byte-identical to the built-in footer's lines 2+ — golden-tested.
   - Not in the shim (not exposed to extensions): `routedModel`
     (virtual-model routing indicator) and `modelRuntime` (subscription
     `(sub)` indicator) → both fall back to plain-model display;
@@ -70,10 +75,10 @@ gone, because the name is already shown in the top border.
   ```
 - **Acceptance Criteria:**
   1. Border: as v2 (all 34 mock checks green).
-  2. Footer: byte-identical to the real `FooterComponent` fed the same
-     session with the name hidden (golden differential at widths
-     200/100/60/30); name changes do not affect the custom footer; the
-     real footer does follow renames (proof the masking, not coincidence).
+  2. Footer: equal to the real `FooterComponent` (same session, name
+     hidden) **minus its first line** — golden differential at widths
+     200/100/60/30; no path text anywhere in the custom footer; name
+     changes do not affect it; the real footer does follow renames.
   3. Single-file footprint: deleting
      `~/.pi/agent/extensions/session-name-border.ts` restores BOTH the
      original border and the original footer.
@@ -89,7 +94,8 @@ gone, because the name is already shown in the top border.
   - `SessionNameEditor extends CustomEditor` — `render()` override.
   - `createNamelessSession(ctx)` — live session shim + name-masking Proxy.
   - `NamelessFooter` — Component wrapper around the real `FooterComponent`
-    (`render` with last-good-frame fallback, `invalidate`, `dispose`).
+    (`render` drops the pwd line + last-good-frame fallback, `invalidate`,
+    `dispose`).
   - factory: `pi.on("session_start", …)` → setEditorComponent + setFooter.
 - `~/.pi/agent/projects/session-name-border/.pi/SPEC.md` — this spec.
 - `~/.pi/agent/projects/session-name-border/test/` — `test.mjs` (34 mock
@@ -119,7 +125,8 @@ gone, because the name is already shown in the top border.
 - [x] **Step 1:** v1 recon (name storage/event, border, editor wiring).
 - [x] **Step 2:** v1 extension + verification (all green).
 - [x] **Step 3 (v2):** `~/path • name` border label, re-verified all green.
-- [x] **Step 4 (v3):** footer override in the same file:
+- [x] **Step 4 (v3→v4):** footer override in the same file (v4: pwd line
+  dropped, not just the name suffix):
   - recon: `setFooter` API + `ReadonlyFooterDataProvider` surface;
     `FooterComponent` root-exported; ExtensionContext live getters;
     interactive-mode footer wiring (no `invalidate` calls on custom footers).
@@ -128,19 +135,20 @@ gone, because the name is already shown in the top border.
     - `test.mjs` 34 checks (border: no-name path, short/70/71/100-char,
       widths 3–100, spinner border, `↑ 8 more` scroll border, session
       switch, live `/name`, whitespace name, CJK, non-home cwd).
-    - `test-real-loader.mjs` 19 checks: real loader zero errors;
-      **golden differential**: custom footer byte-identical to real
-      `FooterComponent` with masked name at widths 200/100/60/30; rename
-      leaves custom footer unchanged while real footer follows; nameless
-      case byte-identical; dispose ok.
+    - `test-real-loader.mjs` 20 checks: real loader zero errors;
+      **golden differential**: custom footer == real `FooterComponent`
+      (masked name) minus its pwd line at widths 200/100/60/30; no path
+      text anywhere in the custom footer (line 1 starts with `↑`);
+      rename leaves custom footer unchanged while real footer follows;
+      nameless case == real nameless footer minus pwd line; dispose ok.
     - `tsc --strict` vs 1.5.0 `.d.ts`: clean (required adding
       `invalidate()` to the wrapper — pi-tui `Component` mandates it).
 - [ ] **Step 5 (user):** live-TUI smoke test:
   - border: `/name short` → `~/… • short`; 100-char name → 70 + `...`;
     `/name ''` → path alone; narrow terminal; spinner coexistence.
-  - footer: first line shows `~/path (branch)` WITHOUT the name; token
-    stats / context % / status lines look exactly as before; after
-    `/name x` the footer line 1 does not change while the border does.
+  - footer: ONE row shorter than stock — no path/branch line; first line
+    is the token stats; status lines look exactly as before; after
+    `/name x` the footer does not change while the border does.
   - delete the extension file → both border and footer revert to stock.
 
 ## 5. Negative Knowledge (Guardrails & Taboos)
