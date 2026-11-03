@@ -1,0 +1,9 @@
+{
+  "name": "pi-themes-extension",
+  "private": true,
+  "type": "module",
+  "description": "pi extension: /themes live-preview theme switcher + 3 example themes (JSON-tweakable)",
+  "scripts": {
+    "test": "node test/core.test.ts && node test/extension.test.ts"
+  }
+}
