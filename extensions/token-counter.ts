@@ -31,7 +31,7 @@
 
 import * as fsp from "node:fs/promises";
 import * as path from "node:path";
-import { getAgentDir, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { getAgentDir, type ExtensionAPI, type ExtensionContext, type Theme } from "@earendil-works/pi-coding-agent";
 import { trackExtensionRun } from "./stats.ts"; // global usage counter (stats extension)
 
 // ---------------------------------------------------------------- config
@@ -251,26 +251,37 @@ export default function (pi: ExtensionAPI) {
   let scanPending = false;
   let interval: ReturnType<typeof setInterval> | undefined;
   let lastText = "";
+  /** Theme instance the current status string was styled with. Theme
+   *  switching replaces the instance, so a reference change triggers a
+   *  restyle on the next update (picked up by the 5s tick within 5s). */
+  let lastTheme: Theme | undefined;
 
   const statusText = (): string => {
     const { input, output } = scanner.totals;
     return `Σ↑${formatTokens(input)} Σ↓${formatTokens(output)} (global)`;
   };
 
-  /** Push the cached text to the footer; no-op when nothing changed. */
+  /**
+   * Push the cached text to the footer; no-op when neither the value nor the
+   * theme changed. Styled with theme.fg("dim", ...) — the same token the
+   * built-in footer applies to the session-stats line above, so the global
+   * counter matches its color.
+   */
   const applyStatus = (): void => {
     const ctx = activeCtx;
     if (!ctx) return;
     if (!enabled || ctx.mode !== "tui") {
       ctx.ui.setStatus(STATUS_KEY, undefined);
       lastText = "";
+      lastTheme = undefined;
       return;
     }
-    const text = statusText();
-    if (text !== lastText) {
-      ctx.ui.setStatus(STATUS_KEY, text);
-      lastText = text;
-    }
+    const plain = statusText();
+    const theme = ctx.ui.theme;
+    if (plain === lastText && theme === lastTheme) return;
+    ctx.ui.setStatus(STATUS_KEY, theme.fg("dim", plain));
+    lastText = plain;
+    lastTheme = theme;
   };
 
   /** Schedule an async scan. Coalesces into at most one in-flight scan. */
