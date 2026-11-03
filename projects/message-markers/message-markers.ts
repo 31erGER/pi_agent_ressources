@@ -38,6 +38,7 @@ import * as fs from "node:fs";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import {
 	compositeTuiLine,
+	Container,
 	isViewportTUI,
 	matchesKey,
 	ScrollView,
@@ -108,40 +109,49 @@ function lineCount(node: unknown, width: number): number {
 }
 
 /**
+ * A component that composites its children via Container.prototype.render
+ * (Container itself and subclasses that don't override render). These must be
+ * descended; components with their own render are opaque leaves.
+ */
+function isCompositeContainer(node: unknown): boolean {
+	return (
+		typeof node === "object" && node !== null && (node as { render?: unknown }).render === Container.prototype.render
+	);
+}
+
+/**
  * Compute the start row (relative to the transcript document) of every user
- * message. `document` is the transcript ScrollView's child: a Container whose
- * direct children are [headerContainer, loadedResourcesContainer,
- * chatContainer]; user messages are direct children of the chat container.
+ * message. `document` is the transcript ScrollView's child; user messages may
+ * sit at any depth (in pi 1.5.0: document → chatContainer → messages), so the
+ * walk is fully recursive: user-shaped nodes are recorded, components with
+ * their own render are measured as leaves (never descended into), and
+ * composite containers are walked.
  */
 export function collectUserMessageOffsets(document: unknown, width: number): number[] {
-	const docChildren = childrenOf(document);
-	if (!docChildren) return [];
 	const startRows: number[] = [];
 	let row = 0;
-	for (const child of docChildren) {
-		if (isUserMessageLike(child)) {
+	const walk = (node: unknown, depth: number): void => {
+		if (depth > 32) return; // defensive: trees are shallow; never loop
+		if (isUserMessageLike(node)) {
 			startRows.push(row);
-			row += lineCount(child, width);
-			continue;
+			row += lineCount(node, width);
+			return;
 		}
-		const subs = childrenOf(child);
-		if (subs && subs.some((s) => isUserMessageLike(s))) {
-			if (DEBUG_FILE) {
-				// Render for diagnostics only; never in the normal path.
-				dbg(
-					"collect: chat container found, children:",
-					subs.map((s) => ({ c: className(s), user: isUserMessageLike(s), lines: lineCount(s, width) })).slice(0, 12),
-				);
-			}
-			for (const sub of subs) {
-				if (isUserMessageLike(sub)) startRows.push(row);
-				row += lineCount(sub, width);
-			}
-		} else {
-			row += lineCount(child, width);
+		if (
+			typeof node === "object" &&
+			node !== null &&
+			typeof (node as { render?: unknown }).render === "function" &&
+			!isCompositeContainer(node)
+		) {
+			row += lineCount(node, width);
+			return;
 		}
-	}
-	if (DEBUG_FILE) dbg("collect: doc children:", docChildren.map((c) => className(c)), "→ offsets:", startRows);
+		const subs = childrenOf(node);
+		if (!subs) return;
+		for (const sub of subs) walk(sub, depth + 1);
+	};
+	walk(document, 0);
+	if (DEBUG_FILE) dbg("collect: → offsets:", startRows);
 	return startRows;
 }
 
@@ -161,9 +171,67 @@ export function pickActiveIndex(startRows: number[], scrollTop: number, viewport
 	return active === -1 ? 0 : active;
 }
 
-/** How many markers the rail may show: half the viewport height, clamped. */
+/**
+ * How many markers the rail may show: one dot per row (a terminal row is the
+ * only unit available; at typical line heights that is ≈15px between dots),
+ * leaving 2 rows of headroom, minimum 3.
+ */
 export function railCapacity(viewportHeight: number): number {
-	return Math.max(3, Math.min(15, Math.floor(viewportHeight / 2)));
+	return Math.max(3, viewportHeight - 2);
+}
+
+/**
+ * The marker column: ~20px (3 columns, font-dependent) to the left of the
+ * scrollbar. pi's scrollbar occupies exactly the last column of the scroll box
+ * (layout.js getScrollbarGeometry), so markers never touch it.
+ */
+export const SCROLLBAR_GAP_COLUMNS = 3;
+export function railMarkerColumn(width: number): number {
+	return Math.max(0, width - 1 - SCROLLBAR_GAP_COLUMNS);
+}
+
+export interface RailMark {
+	/** Index into the user-message list, or null for a “…” ellipsis row. */
+	index: number | null;
+	active: boolean;
+}
+
+export interface RailLayout {
+	marks: RailMark[];
+	/** First document row the rail occupies (doc row = scrollTop + top + i). */
+	top: number;
+	/** 0-based column of the marker glyph. */
+	col: number;
+}
+
+/**
+ * Shared rail geometry used by BOTH the per-frame render and the click
+ * mapping — what you see is exactly what you can click.
+ */
+export function computeRail(
+	width: number,
+	startRows: number[],
+	scrollTop: number,
+	viewportHeight: number,
+	docHeight: number,
+): RailLayout | null {
+	if (startRows.length === 0) return null;
+	const active = pickActiveIndex(startRows, scrollTop, viewportHeight);
+	const window = windowIndices(startRows.length, active, railCapacity(viewportHeight));
+	const marks: RailMark[] = [];
+	if (window[0] > 0) marks.push({ index: null, active: false });
+	for (const idx of window) marks.push({ index: idx, active: idx === active });
+	if (window[window.length - 1] < startRows.length - 1) marks.push({ index: null, active: false });
+	const visibleHeight = Math.max(0, Math.min(viewportHeight, docHeight - scrollTop));
+	const top = Math.max(0, Math.floor((visibleHeight - marks.length) / 2));
+	return { marks, top, col: railMarkerColumn(width) };
+}
+
+/** User-message index under a document row, or null (outside rail / ellipsis). */
+export function markerIndexForClick(docRow: number, rail: RailLayout, scrollTop: number): number | null {
+	const i = docRow - scrollTop - rail.top;
+	if (i < 0 || i >= rail.marks.length) return null;
+	return rail.marks[i].index;
 }
 
 /**
@@ -195,6 +263,8 @@ export interface RailState {
 	transcript: ScrollView | null;
 	getTheme: () => RailTheme;
 	lastWidth: number;
+	/** Rendered document height from the last frame (for click geometry). */
+	docHeight: number;
 	cacheKey: string | null;
 	offsets: number[];
 }
@@ -286,24 +356,22 @@ export class MarkerRail {
 		const scrollTop = transcript.scrollTop;
 		const vh = transcript.viewportHeight > 0 ? transcript.viewportHeight : lines.length;
 		const rows = this.refreshOffsets(width);
-		if (rows.length === 0) return lines;
-		const active = pickActiveIndex(rows, scrollTop, vh);
-		const window = windowIndices(rows.length, active, railCapacity(vh));
+		this.state.docHeight = lines.length;
+		const rail = computeRail(width, rows, scrollTop, vh, lines.length);
+		if (!rail) return lines;
 		const theme = this.state.getTheme();
-		const marks: string[] = [];
-		if (window[0] > 0) marks.push(theme.fg("dim", "… "));
-		for (const idx of window) {
-			marks.push(idx === active ? theme.fg("accent", "▸ ") : theme.fg("dim", "· "));
-		}
-		if (window[window.length - 1] < rows.length - 1) marks.push(theme.fg("dim", "… "));
-		// Vertical centering within the visible viewport, mapped into document rows.
-		const visibleHeight = Math.max(0, Math.min(vh, lines.length - scrollTop));
-		const top = Math.max(0, Math.floor((visibleHeight - marks.length) / 2));
-		const col = width - 2;
-		for (let i = 0; i < marks.length; i++) {
-			const docRow = scrollTop + top + i;
+		for (let i = 0; i < rail.marks.length; i++) {
+			const docRow = scrollTop + rail.top + i;
 			if (docRow < 0 || docRow >= lines.length) continue;
-			lines[docRow] = compositeTuiLine(lines[docRow], marks[i], col, 2, width);
+			const mark = rail.marks[i];
+			const text = mark.index === null ? "… " : mark.active ? "▸ " : "· ";
+			lines[docRow] = compositeTuiLine(
+				lines[docRow],
+				theme.fg(mark.active ? "accent" : "dim", text),
+				rail.col,
+				2,
+				width,
+			);
 		}
 		return lines;
 	}
@@ -324,9 +392,66 @@ export class MarkerRail {
 					? 0
 					: rows.length - 1
 				: Math.max(0, Math.min(rows.length - 1, active + direction));
-		transcript.scrollTo(rows[target], { disableFollow: true });
+		return this.jumpTo(target);
+	}
+
+	/** Scroll the transcript so user message `index` starts at the viewport top. */
+	jumpTo(index: number): boolean {
+		const { transcript, activeTui } = this.state;
+		if (!this.state.enabled || !transcript || !activeTui || isStopped(activeTui)) return false;
+		const width = this.state.lastWidth;
+		if (width <= 0) return false;
+		const rows = this.refreshOffsets(width);
+		if (index < 0 || index >= rows.length) return false;
+		transcript.scrollTo(rows[index], { disableFollow: true });
 		activeTui.requestRender();
 		return true;
+	}
+
+	/**
+	 * Mouse handling for the marker rail. Event coordinates are document-space
+	 * (the scroll node translates this wrapper's layout box by -scrollTop), so
+	 * event.y is a document row and event.x a content column. Returns a
+	 * TuiMouseEventResult for events on the marker band, or undefined to pass
+	 * through (text selection etc. must keep working everywhere else).
+	 */
+	mouse(event: { type: string; x: number; y: number }): { handled: boolean; render?: boolean } | undefined {
+		if (!this.state.enabled || !this.state.transcript || !this.state.activeTui || isStopped(this.state.activeTui)) {
+			return undefined;
+		}
+		const width = this.state.lastWidth;
+		if (width <= 0) return undefined;
+		const transcript = this.state.transcript;
+		const scrollTop = transcript.scrollTop;
+		const vh = transcript.viewportHeight > 0 ? transcript.viewportHeight : 1;
+		const rows = this.refreshOffsets(width);
+		const rail = computeRail(width, rows, scrollTop, vh, this.state.docHeight > 0 ? this.state.docHeight : vh);
+		if (DEBUG_FILE) {
+			dbg("mouse:", event.type, { x: event.x, y: event.y }, "rail:", rail ? { top: rail.top, col: rail.col, marks: rail.marks } : null, "scrollTop:", scrollTop, "vh:", vh, "docH:", this.state.docHeight);
+		}
+		if (!rail) return undefined;
+		if (Math.abs(event.x - rail.col) > 1) {
+			if (DEBUG_FILE) dbg("mouse: outside band, pass through");
+			return undefined; // outside the marker band
+		}
+		if (event.type === "press") {
+			// Claim the press so the TUI does not start a text selection on the
+			// rail. The jump happens on the synthesized "click" (release on the
+			// same spot): jumping on press would shift the document under the
+			// cursor and the release would re-map to a different marker.
+			return { handled: true, render: false };
+		}
+		if (event.type === "click") {
+			const index = markerIndexForClick(event.y, rail, scrollTop);
+			if (index === null) {
+				if (DEBUG_FILE) dbg("mouse: click on ellipsis/outside rail block, no jump");
+				return { handled: true, render: false };
+			}
+			if (DEBUG_FILE) dbg("mouse: click → jumpTo", index);
+			this.jumpTo(index);
+			return { handled: true };
+		}
+		return undefined;
 	}
 }
 
@@ -353,9 +478,16 @@ export class RailDocument implements Component {
 		return this.rail.overlay(lines, width);
 	}
 
-	handleMouse(event: TuiMouseEvent): TuiMouseEventResult {
-		// The layout box of this wrapper has exactly the document's rect, so
-		// event coordinates are valid for the wrapped document as-is.
+	handleMouse(event: TuiMouseEvent): TuiMouseEventResult | undefined {
+		// 1) The rail: clicks on the marker band jump to that user message.
+		try {
+			const railResult = this.rail.mouse(event);
+			if (railResult) return railResult;
+		} catch {
+			// the rail must never break mouse handling
+		}
+		// 2) Otherwise: the wrapper's layout box has exactly the document's rect,
+		// so event coordinates are valid for the wrapped document as-is.
 		const fn = (this.inner as { handleMouse?: (e: TuiMouseEvent) => TuiMouseEventResult }).handleMouse;
 		return typeof fn === "function" ? fn.call(this.inner, event) : undefined;
 	}
@@ -524,6 +656,7 @@ export default function (pi: ExtensionAPI): void {
 		transcript: null,
 		getTheme: () => fallbackTheme,
 		lastWidth: 0,
+		docHeight: 0,
 		cacheKey: null,
 		offsets: [],
 	};

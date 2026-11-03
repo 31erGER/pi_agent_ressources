@@ -1,9 +1,10 @@
 # message-markers — right-edge marker rail for your own messages
 
 A pi agent extension for long sessions. In **fullscreen TUI mode** it draws a vertical
-marker rail on the **right side of the window, vertically centered** — **one marker per
-user message you sent** — with the marker of the user message you are currently viewing
-highlighted. You can jump between your own messages with a keypress.
+marker rail on the **right side of the window, vertically centered** — **one clickable
+dot per user message you sent** — with the marker of the user message you are currently
+viewing highlighted. You can jump between your own messages with a keypress or by
+**clicking a dot**.
 
 Installed (live): `~/.pi/agent/extensions/message-markers.ts` (auto-discovered, single
 file, no runtime dependencies). This project directory holds the canonical copy
@@ -20,14 +21,35 @@ Verified against pi **1.5.0**.
 | Status | `/markers status` — reports on/off + tracked user-message count |
 | Jump to previous user message | `alt+up` |
 | Jump to next user message | `alt+down` |
+| Jump to a specific user message | **left-click its dot** in the rail |
 
 The rail shows `·` for each user message and `▸` (accent color) for the one currently in
 view; when there are more markers than fit, it shows a window centered on the active
 marker with `…` on the truncated ends. Markers follow the viewport while you scroll.
 
-Jumping scrolls the transcript so the target user message starts at the top of the
-transcript viewport. Plain typing and other keys are unaffected; when the rail is off
-(or there is no transcript to jump within) `alt+up`/`alt+down` pass through untouched.
+Jumping (keyboard or click) scrolls the transcript so the target user message starts at
+the top of the transcript viewport. Plain typing and other keys are unaffected; when the
+rail is off (or there is no transcript to jump within) `alt+up`/`alt+down` pass through
+untouched.
+
+### Geometry (pixels as terminal cells)
+
+- The rail sits **3 columns left of the right edge** — i.e. left of the scrollbar, which
+  owns the last column. In a 100-column terminal the dots are at column 96 (0-based),
+  the scrollbar at column 99. 3 columns ≈ the requested "20px" gap; a terminal exposes
+  cell units, not CSS pixels.
+- Dots are spaced **1 row apart** (≈ the requested "15px").
+- The marker block is **vertically centered** in the transcript viewport, in the same
+  vertical direction as the scrollbar.
+
+### Clicking
+
+- Left-click a dot (or the active arrow) to jump to that user message. The click is
+  consumed: the scrollbar drag, text selection, and right-click paste behavior are left
+  untouched, and only the narrow band around the rail column (±1 column) is claimed —
+  every other click passes through exactly as before.
+- Clicking a `…` row does nothing (it is not a jump target).
+- When the rail is off, all clicks pass through.
 
 ### Keybinding notes
 
@@ -62,14 +84,35 @@ transcript viewport. Plain typing and other keys are unaffected; when the rail i
   `start()`, plus a `session_start` `ctx.ui.custom()` capture for the initial TUI
   (which starts before extensions load). Re-installation is idempotent
   ("already wrapped, re-synced").
-- **User-message detection:** user messages are direct children of the chat container
-  in the transcript tree, matched by duck-typing the runtime shape of pi's
-  `UserMessageComponent` (`text` string + `markdownTransformers` array, no `message`
-  field). OSC 133 zone markers are *not* used — tool-call-free assistant messages
-  embed them too.
+- **User-message detection (fully recursive):** user messages are matched by
+  duck-typing the runtime shape of pi's `UserMessageComponent` (`text` string +
+  `markdownTransformers` array, no `message` field). OSC 133 zone markers are *not*
+  used — tool-call-free assistant messages embed them too. The walk is **fully
+  recursive** (with a depth guard): user-shaped nodes are recorded wherever they sit
+  (this is what makes **resumed sessions and pre-extension-activation prompts** get
+  markers — their components live deeper in the tree), components with their own
+  `render` are measured as opaque leaves (never descended into), and plain
+  `Container` nodes (those rendering via `Container.prototype.render`) are descended.
+  Note the container test is `render === Container.prototype.render`, not
+  `typeof render === "function"` — `Container` inherits a `render` from `TuiBase`
+  through the prototype chain, so a plain type check would treat containers as opaque
+  leaves and find nothing.
 - **Offsets:** start row = cumulative rendered height of preceding transcript
   children; cached, keyed by a structural snapshot of the transcript tree, so
   streaming growth of the last assistant message does not re-walk per frame.
+- **Capacity:** one dot per visible row of the transcript viewport (`max(3,
+  viewportHeight - 2)`), so long sessions get a full dot-per-message rail instead of a
+  7-dot window; the `…` windowing remains for pathologically tall viewports.
+- **Mouse:** the wrapper implements `handleMouse`. pi dispatches layout mouse events
+  deepest-first; events inside the rail band (±1 column around the marker column) are
+  claimed by the rail — `press` is swallowed (so no selection starts), the `click`
+  (release on the same component) maps the document row through the *current* rail
+  geometry and jumps via the shared `jumpTo(index)`. Events outside the band return
+  `undefined` and fall through to the wrapped document (and pi's scrollbar/selection/
+  scroll-to-end handling above it). Jumping happens on `click`, never on `press` —
+  jumping on press would move the document under the cursor and double-jump on
+  release. The wrapper's layout box is the document's box (translated by `-scrollTop`),
+  so no extra scroll offset is applied in `handleMouse`.
 - **Active marker:** the last user message whose start row is at or above the viewport
   bottom; falls back to the first message when the viewport is above all of them.
 - **Exception-safe:** every install path is wrapped in try/catch; a failure only
@@ -92,11 +135,12 @@ transcript viewport. Plain typing and other keys are unaffected; when the rail i
 
 ## Limitations
 
-- Right-edge 2-column markers may overtype the last 2 columns of a very long
-  transcript line (the rail is drawn on top; `compositeTuiLine` skips Kitty image
-  lines).
+- Right-edge 2-column markers (in a 3-column gap left of the scrollbar) may overtype
+  the last 2 content columns of a very long transcript line (the rail is drawn on top;
+  `compositeTuiLine` skips Kitty image lines).
 - Markers reflect what is *rendered* in the transcript tree; hidden/collapsed
-  segments have no markers.
+  segments and **compacted-away messages** have no markers. Resumed sessions show
+  markers for every user message that is actually rendered.
 - After `/reload` the rail state resets to the default (on).
 
 ## Debugging
@@ -110,18 +154,25 @@ Writes install/uninstall/overlay/collect traces. No effect on rendering otherwis
 ## Tests
 
 ```sh
-# pure logic (active-index math, windowing, capacity, detection, offsets)
+# pure logic (rail geometry, column, active-index math, windowing, capacity,
+# detection, offsets, click mapping)
 node ~/.pi/agent/projects/message-markers/tests/message-markers.test.ts
 
-# entry-point smoke (registration, idempotent patch, /markers, disabled guard)
+# entry-point smoke (registration, idempotent patch, /markers, disabled guard,
+# mouse pass-through)
 node ~/.pi/agent/projects/message-markers/tests/message-markers.load-smoke.ts
 
-# real fullscreen session over a PTY: rail glyphs, alt+up/alt+down jumps, /quit
+# real fullscreen sessions over a PTY (self-contained; builds its own fixture):
+#   0) 4-message fixture session
+#   1) fresh session: rail at column 96 (3 cols left of the scrollbar), 1 row per
+#      dot, vertically centered, alt+up jump, SGR left-click on a dot jumps, /quit
+#   2) resume the fixture: 4 markers (3 dots + active) for pre-activation messages
 python3 ~/.pi/agent/projects/message-markers/tests/message-markers.pty-e2e.py
 ```
 
-All three pass on pi 1.5.0 (2026-11-03): 19/19 unit, 10/10 smoke (incl. the
-stale-ctx render regression tests), 5/5 e2e.
+All three pass on pi 1.5.0 (2026-11-03): 29/29 unit, 16/16 smoke (incl. the
+stale-ctx render regression tests), 10/10 e2e.
+`MM_DEBUG=1` makes the e2e driver print reconstructed screens at checkpoints.
 
 ## Files
 

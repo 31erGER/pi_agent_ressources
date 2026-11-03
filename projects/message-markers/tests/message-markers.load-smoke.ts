@@ -7,10 +7,11 @@
  */
 
 import { strict as assert } from "node:assert";
-import { TuiAltScreen, type TUI } from "@earendil-works/pi-tui";
+import { Container, TuiAltScreen, type TUI, type TuiMouseEvent } from "@earendil-works/pi-tui";
 import defaultExport, {
 	installRail,
 	MarkerRail,
+	RailDocument,
 	railStateForTests,
 	type RailState,
 } from "../../../extensions/message-markers.ts";
@@ -216,6 +217,7 @@ await test("installRail: disabled state short-circuits before touching the TUI",
 		transcript: null,
 		getTheme: () => ({ fg: (_c: string, text?: string) => text ?? "" }),
 		lastWidth: 0,
+		docHeight: 0,
 		cacheKey: null,
 		offsets: [],
 	};
@@ -223,6 +225,125 @@ await test("installRail: disabled state short-circuits before touching the TUI",
 	installRail(trapTui as unknown as TUI, state, rail); // must not throw
 	assert.equal(state.activeTui, null, "state.activeTui untouched");
 	assert.equal(state.transcript, null, "state.transcript untouched");
+});
+
+// --- mouse: clickable markers ------------------------------------------------
+
+/**
+ * Fake transcript geometry: 4 user messages × 12 rows at width 100.
+ * rows = [0, 12, 24, 36], docHeight 48, scrollTop 10, viewport 40.
+ * → active = 3, marks = 4 (no ellipsis), top = floor((38-4)/2) = 17,
+ *   col = 96; doc rows of marks: 27, 28, 29, 30.
+ */
+function setupMouseTest(rows: number, perMsg: number) {
+	// Production shape: the transcript document is a Container whose children
+	// include user-shaped components with their own render().
+	const doc = new Container();
+	for (let i = 0; i < rows; i++) {
+		doc.addChild({
+			text: `user text ${i}`,
+			markdownTransformers: [],
+			render: () => new Array(perMsg).fill(""),
+		} as never);
+	}
+	const state = railStateForTests();
+	state.enabled = true;
+	// hermetic theme (earlier tests swap in a "◆ " theme)
+	state.getTheme = () => ({ fg: (_c: string, text?: string) => text ?? "" });
+	state.activeTui = { mode: "fullscreen", stopped: false, requestRender: () => {} } as never;
+	state.lastWidth = 100;
+	state.cacheKey = null;
+	const scrolls: number[] = [];
+	const renders = { n: 0 };
+	const rail = new MarkerRail(state);
+	const wrapped = new RailDocument(doc as never, rail);
+	state.transcript = {
+		child: wrapped,
+		scrollTop: 10,
+		viewportHeight: 40,
+		scrollTo: (row: number) => {
+			scrolls.push(row);
+		},
+	} as unknown as RailState["transcript"];
+	state.docHeight = rows * perMsg;
+	return { wrapped, scrolls, renders, state };
+}
+
+/** Strip escape/OSC sequences → the visible cell text of a rendered line. */
+function visible(line: string): string {
+	return line.replace(/\u001b\][^\u0007]*\u0007/g, "").replace(/\u001b\[[0-9;]*[A-Za-z]/g, "");
+}
+
+/** A realistic TuiMouseEvent (the TUI always fills width/height/button). */
+function evt(type: string, x: number, y: number, height: number): TuiMouseEvent {
+	return { type, button: "left", x, y, screenX: x, screenY: y, width: 100, height, shift: false, alt: false, ctrl: false } as unknown as TuiMouseEvent;
+}
+
+await test("overlay: markers render at col 96 (3 cols left of the scrollbar at 99)", async () => {
+	const { wrapped } = setupMouseTest(4, 12);
+	const out = wrapped.render(100);
+	assert.equal(out.length, 48);
+	// doc rows 27..30 hold the marks (scrollTop 10 + top 17 + i)
+	assert.equal(visible(out[27]).indexOf("·"), 96, "first dot at col 96");
+	assert.equal(visible(out[30]).indexOf("▸"), 96, "active marker at col 96");
+	assert.equal(visible(out[26]).indexOf("·"), -1, "nothing above the rail block");
+	assert.equal(visible(out[27]).slice(96, 98), "· ", "glyph occupies cols 96-97");
+	assert.ok([...visible(out[27]).slice(98)].every((c) => c === " "), "scrollbar col 99 untouched");
+});
+
+await test("click on a dot jumps to that user message", async () => {
+	const { wrapped, scrolls } = setupMouseTest(4, 12);
+	const res = wrapped.handleMouse(evt("click", 96, 28, 48));
+	assert.deepEqual(res, { handled: true }, "click on the rail is consumed");
+	assert.deepEqual(scrolls, [12], "scrolled to the 2nd user message");
+});
+
+await test("click band is 1 column wide on each side of the glyph", async () => {
+	const { wrapped, scrolls } = setupMouseTest(4, 12);
+	const left = wrapped.handleMouse(evt("click", 95, 28, 48));
+	assert.ok(left && left.handled, "col 95 (glyph start) is in the band");
+	assert.deepEqual(scrolls, [12]);
+	scrolls.length = 0;
+	const right = wrapped.handleMouse(evt("click", 97, 28, 48));
+	assert.ok(right && right.handled, "col 97 (glyph+space) is in the band");
+	assert.deepEqual(scrolls, [12]);
+	scrolls.length = 0;
+	const outside = wrapped.handleMouse(evt("click", 94, 28, 48));
+	assert.equal(outside, undefined, "col 94 passes through (selection intact)");
+	assert.deepEqual(scrolls, [], "no scroll on pass-through");
+});
+
+await test("press in the band is claimed (no selection) but does not scroll yet", async () => {
+	const { wrapped, scrolls } = setupMouseTest(4, 12);
+	const res = wrapped.handleMouse(evt("press", 96, 28, 48));
+	assert.deepEqual(res, { handled: true, render: false });
+	assert.deepEqual(scrolls, [], "jump happens on click, not press");
+});
+
+await test("click inside the band but off the rail block / on an ellipsis does nothing", async () => {
+	const { wrapped, scrolls } = setupMouseTest(4, 12);
+	const res = wrapped.handleMouse(evt("click", 96, 26, 48));
+	assert.ok(res && res.handled && res.render === false, "consumed, no jump");
+	assert.deepEqual(scrolls, []);
+
+	// 8 messages, viewport 8 → capacity 6 → trailing ellipsis at doc row 16
+	const eight = setupMouseTest(8, 12);
+	(eight.state.transcript as { viewportHeight: number }).viewportHeight = 8;
+	const dot = eight.wrapped.handleMouse(evt("click", 96, 11, 96));
+	assert.ok(dot && dot.handled);
+	assert.deepEqual(eight.scrolls, [12], "first real dot jumps to message 2");
+	eight.scrolls.length = 0;
+	const dots = eight.wrapped.handleMouse(evt("click", 96, 16, 96));
+	assert.ok(dots && dots.handled && dots.render === false, "ellipsis consumed, no jump");
+	assert.deepEqual(eight.scrolls, []);
+});
+
+await test("mouse pass-through when the rail is disabled", async () => {
+	const { wrapped, scrolls } = setupMouseTest(4, 12);
+	wrapped.rail.state.enabled = false;
+	const res = wrapped.handleMouse(evt("click", 96, 28, 48));
+	assert.equal(res, undefined, "disabled rail passes the click through");
+	assert.deepEqual(scrolls, []);
 });
 
 console.log(`\n${passes} passed, ${failures} failed`);

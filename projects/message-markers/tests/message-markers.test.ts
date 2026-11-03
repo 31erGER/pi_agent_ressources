@@ -6,11 +6,15 @@
  */
 
 import { strict as assert } from "node:assert";
+import { Container } from "@earendil-works/pi-tui";
 import {
 	collectUserMessageOffsets,
+	computeRail,
 	isUserMessageLike,
+	markerIndexForClick,
 	pickActiveIndex,
 	railCapacity,
+	railMarkerColumn,
 	windowIndices,
 } from "../../../extensions/message-markers.ts";
 
@@ -98,15 +102,25 @@ test("pickActiveIndex: a message starting exactly at the viewport bottom is not 
 // railCapacity
 // ---------------------------------------------------------------------------
 
-test("railCapacity: half the viewport height, clamped to [3, 15]", () => {
-	assert.equal(railCapacity(40), 15); // floor(20) clamped down to 15
-	assert.equal(railCapacity(100), 15);
-	assert.equal(railCapacity(30), 15); // floor(15)
-	assert.equal(railCapacity(28), 14); // floor(14)
-	assert.equal(railCapacity(10), 5);
-	assert.equal(railCapacity(6), 3);
-	assert.equal(railCapacity(4), 3); // floor(2) clamped up to 3
+test("railCapacity: one dot per row (≈15px spacing) — viewport minus 2, min 3", () => {
+	assert.equal(railCapacity(40), 38);
+	assert.equal(railCapacity(100), 98);
+	assert.equal(railCapacity(14), 12);
+	assert.equal(railCapacity(6), 4);
+	assert.equal(railCapacity(4), 3); // 4-2=2 clamped up to 3
 	assert.equal(railCapacity(1), 3);
+	assert.equal(railCapacity(0), 3);
+});
+
+// ---------------------------------------------------------------------------
+// railMarkerColumn
+// ---------------------------------------------------------------------------
+
+test("railMarkerColumn: 3 columns (≈20px) left of the scrollbar column", () => {
+	assert.equal(railMarkerColumn(100), 96); // scrollbar at 99, gap cols 97-99
+	assert.equal(railMarkerColumn(80), 76);
+	assert.equal(railMarkerColumn(8), 4);
+	assert.equal(railMarkerColumn(4), 0); // never negative
 });
 
 // ---------------------------------------------------------------------------
@@ -224,6 +238,116 @@ test("collectUserMessageOffsets: invalid input → empty array", () => {
 	assert.deepEqual(collectUserMessageOffsets(null, 80), []);
 	assert.deepEqual(collectUserMessageOffsets({ children: "nope" }, 80), []);
 	assert.deepEqual(collectUserMessageOffsets({}, 80), []);
+});
+
+test("collectUserMessageOffsets: finds user messages at any nesting depth", () => {
+	const doc = {
+		children: [
+			fakeLines(2), // rows 0..2
+			{
+				children: [
+					{
+						children: [
+							{
+								children: [userMsg(3)], // user at 3 levels below doc, row 2
+							},
+							],
+						},
+					],
+				},
+			],
+	};
+	assert.deepEqual(collectUserMessageOffsets(doc, 80), [2]);
+});
+
+test("collectUserMessageOffsets: real pi Containers are descended (production shape)", () => {
+	// In pi 1.5.0 the transcript document is a Container that composites its
+	// children via Container.prototype.render — the walker must descend into
+	// it, not treat it as a rendered leaf.
+	const doc = new Container();
+	const filler = fakeLines(2);
+	const msg = userMsg(3);
+	const chat = new Container();
+	chat.addChild(filler);
+	chat.addChild(msg);
+	const header = new Container();
+	doc.addChild(header);
+	doc.addChild(chat);
+	assert.deepEqual(collectUserMessageOffsets(doc, 80), [2]);
+});
+
+test("collectUserMessageOffsets: does not descend into rendered components", () => {
+	// A component with its own render() is measured as a leaf; its children
+	// (even user-shaped ones) are part of its rendering, not separate rows.
+	const renderedParent = fakeLines(4, { children: [userMsg(2)] });
+	const doc = { children: [renderedParent, userMsg(1)] };
+	assert.deepEqual(collectUserMessageOffsets(doc, 80), [4]);
+});
+
+// ---------------------------------------------------------------------------
+// computeRail (shared geometry for rendering AND click mapping)
+// ---------------------------------------------------------------------------
+
+test("computeRail: null when there are no user messages", () => {
+	assert.equal(computeRail(100, [], 0, 40, 200), null);
+});
+
+test("computeRail: marks, active flag, vertical centering and column", () => {
+	const rail = computeRail(100, [10, 50, 90], 45, 40, 200);
+	assert.ok(rail);
+	assert.equal(rail.col, 96);
+	assert.deepEqual(rail.marks.map((m) => m.index), [0, 1, 2]);
+	assert.deepEqual(rail.marks.map((m) => m.active), [false, true, false]);
+	// 3 marks in a 40-row viewport → top = floor((40-3)/2) = 18
+	assert.equal(rail.top, 18);
+});
+
+test("computeRail: leading ellipsis when windowed", () => {
+	const rows = Array.from({ length: 50 }, (_, i) => i);
+	const rail = computeRail(100, rows, 0, 40, 50);
+	assert.ok(rail);
+	// capacity 38, active 39 → window [12..49] → leading ellipsis + 38 dots
+	assert.equal(rail.marks.length, 39);
+	assert.equal(rail.marks[0].index, null);
+	assert.equal(rail.marks[1].index, 12);
+	assert.equal(rail.marks[38].index, 49);
+	assert.equal(rail.marks[28].active, true); // index 39 is active
+	// 39 marks in a 40-row viewport → top = floor((40-39)/2) = 0
+	assert.equal(rail.top, 0);
+});
+
+test("computeRail: centers within the visible part when the document is shorter than the viewport", () => {
+	const rail = computeRail(100, [2], 0, 40, 5);
+	assert.ok(rail);
+	assert.equal(rail.marks.length, 1);
+	assert.equal(rail.top, 2); // floor((5-1)/2)
+
+	const rail2 = computeRail(100, [2, 8], 3, 40, 10);
+	assert.ok(rail2);
+	assert.equal(rail2.top, 2); // visible = min(40, 10-3)=7 → floor((7-2)/2)=2
+	assert.equal(rail2.marks[1].active, true);
+});
+
+// ---------------------------------------------------------------------------
+// markerIndexForClick
+// ---------------------------------------------------------------------------
+
+test("markerIndexForClick: maps a document row to the user-message index", () => {
+	const rail = computeRail(100, [10, 50, 90], 45, 40, 200)!;
+	// mark i sits at document row scrollTop + top + i = 45 + 18 + i
+	assert.equal(markerIndexForClick(63, rail, 45), 0);
+	assert.equal(markerIndexForClick(64, rail, 45), 1);
+	assert.equal(markerIndexForClick(65, rail, 45), 2);
+	// outside the rail block → null
+	assert.equal(markerIndexForClick(62, rail, 45), null);
+	assert.equal(markerIndexForClick(66, rail, 45), null);
+});
+
+test("markerIndexForClick: ellipsis rows map to null", () => {
+	const rows = Array.from({ length: 50 }, (_, i) => i);
+	const rail = computeRail(100, rows, 0, 40, 50)!;
+	assert.equal(markerIndexForClick(0, rail, 0), null); // leading ellipsis row
+	assert.equal(markerIndexForClick(1, rail, 0), 12); // first real dot
 });
 
 // ---------------------------------------------------------------------------
