@@ -5,5 +5,6 @@
   "enableInstallTelemetry": false,
   "extensions": [
     "/home/julian/.pi/projects/audio-notification/notify-on-settle.ts"
-  ]
+  ],
+  "theme": "system"
 }
