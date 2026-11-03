@@ -7,142 +7,193 @@
 > text is not bigger than 70 characters, and if it is longer, `...` dots are
 > appended at the end of the (truncated) session name.
 
+**v2:** the border label is footer-styled: `~/some/path • session name`
+(`~` home-abbreviation, ` • ` separator, same path formatting as the
+original footer).
+
+**v3 (current):** the built-in footer is **overridden in the SAME file**
+so that deleting this single extension file restores pi's original look and
+feel. The footer renders the original built-in footer byte-identical —
+except the `• <session name>` suffix on its first (path/branch) line is
+gone, because the name is already shown in the top border.
+
 ## 2. Technical Architecture & Data Flow
-- **Core Mechanism:** the colored top line of the chat input is the editor's
-  top border (`Editor.render()` → `renderTopBorder()`, a `─` run colored via
-  the editor's dynamic `borderColor` fn — thinking-level / bash-mode color).
-  The extension replaces the editor component with a `CustomEditor` subclass
-  (`embedWorkingStatus: true`, so the built-in working spinner keeps working)
-  whose `render(width)` override rewrites `lines[0]`: it finds the trailing
-  run of `─` in the (ANSI-stripped) top border and replaces it with
-  `<filler>─<space><label><space>─`, i.e. the label is right-anchored in the
-  line but its text is left-anchored (beginning of the name first, truncation
-  at the right end only).
-- **Name source:** read **live on every render** from
-  `ctx.sessionManager.getSessionName()` (latest `session_info` entry;
-  `undefined` when unset/cleared). No extension-side state to sync:
-  - `/name <name>` → `session.setSessionName()` → `appendSessionInfo()` +
-    `session_info_changed` event → the TUI already re-renders on that event
-    (`interactive-mode.js:2777`), so the border updates immediately.
-  - `/new`, `/resume`, `/fork`, `/reload` → `session_start` → the extension
-    re-registers the editor factory with the fresh session's `ctx`, so the
-    label follows the session.
-  - No name set → top border left exactly as built-in (spinner/scroll
-    indicators included).
-- **Truncation rules (label "stuck to the left"):**
-  1. `visibleWidth(name) <= 70` → show the full name.
-  2. else → first 70 visible columns + ASCII `...` (name part ≤ 70 chars,
-     dots at the end).
-  3. If the terminal is too narrow for ` <label> ` + one trailing dash
-     (working spinner / `↑ N more` indicator occupies the left), re-truncate
-     the *name* from the right to fit (ellipsis kept when ≥ 4 name columns
-     remain); the left part of the name is never the part that gets cut.
-  4. No room at all → render the plain border (label dropped).
+- **Top border (v2, unchanged):** the editor's top border (`lines[0]` of
+  `Editor.render()`) is rewritten by a `CustomEditor` subclass
+  (`embedWorkingStatus: true`). `appendSessionName()` finds the trailing `─`
+  run in the ANSI-stripped line and replaces it with one single
+  `borderColor`-colored segment `<filler>─ <label> ─`.
+- **Label:** `formatCwd(ctx.sessionManager.getCwd(), HOME)`
+  (+ ` • <capName(name)>` when a non-empty name is set; no name → path
+  alone; whitespace name → path alone). `formatCwd` replicates the
+  built-in footer's `formatCwdForFooter` (home → `~`, outside home → raw).
+  Git branch intentionally not in the border label.
+- **Truncation (label "stuck to the left"):**
+  1. Name part: `visibleWidth > 70` → first 70 visible columns + `...`
+     (dots always appended on truncation — see fixed bug in §5).
+  2. Full label wider than the border budget (`trailing - 3`): re-truncate
+     the whole label from the right with `...` (no dots when budget < 4:
+     show as much as fits; budget ≤ 0: plain border).
+- **Footer (v3):** `ctx.ui.setFooter(factory)` — the factory wraps pi's
+  **real `FooterComponent`** (root-exported) with a session shim:
+  - shim getters resolve LIVE at call time from `ctx` (pi resolves
+    ExtensionContext values at call time — verified in `runner.js
+    createContext()`), so model/thinking-level/context-usage changes are
+    picked up without extra event wiring;
+  - `sessionManager` is a `Proxy` over `ctx.sessionManager` that masks
+    **only** `getSessionName()` → `undefined`; every other method is bound
+    and forwarded, so usage stats, cwd, etc. come from the real manager;
+  - the wrapper `NamelessFooter` implements pi-tui `Component`
+    (`render` + `invalidate`) and `dispose`; `render()` is guarded with
+    try/catch → on any error it returns the last good frame instead of
+    throwing into the TUI render loop.
+  - Consequence: footer line 1 = `~/path (branch)` (no name), lines 2+
+    (token stats, context %, model info, extension status lines) are
+    byte-identical to the built-in footer — golden-tested.
+  - Not in the shim (not exposed to extensions): `routedModel`
+    (virtual-model routing indicator) and `modelRuntime` (subscription
+    `(sub)` indicator) → both fall back to plain-model display;
+    `autoCompactEnabled` stays `true` → `(auto)` shown even if the user
+    disabled auto-compact in settings (minor cosmetic edge).
 - **Data / Control Flow:**
   ```
-  /name <name> → session.setSessionName → session_info entry + session_info_changed
-              → TUI requestRender (built-in) → editor.render(width)
-              → super.render(width) (lines[0] = top border)
-              → appendSessionName(lines[0], name) → colored label at right edge
+  /name <name> → setSessionName → session_info entry + session_info_changed
+              → TUI re-render (built-in) → editor.render() [label live]
+              (footer re-renders too, but its name getter is masked → no change)
 
-  session_start(tui) → ctx.ui.setEditorComponent(factory)
-  → InteractiveMode.setCustomEditorComponent → factory(tui, theme, keybindings)
-  → new SessionNameEditor (captures ctx via getName closure)
+  session_start(tui) → ctx.ui.setEditorComponent(editorFactory)
+                      → ctx.ui.setFooter(footerFactory)   [both re-bound per session]
+  footerFactory(tui, theme, footerData)
+              → new NamelessFooter(new FooterComponent(shim(ctx), footerData))
+  git branch change → interactive-mode's own onBranchChange subscription
+              → requestRender → footer re-reads getGitBranch() [no wiring needed]
   ```
 - **Acceptance Criteria:**
-  1. With a name ≤ 70 visible chars: top border shows `…─ <name> ─` (one
-     dash gap on each side of the label, right-anchored), same color as the
-     line; the rest of the border (spinner while working, `↑ N more` when
-     scrolled) is preserved.
-  2. With a name > 70 visible chars: exactly the first 70 visible columns are
-     shown followed by `...` (never the tail of the name).
-  3. With no name: the top border is byte-identical to the built-in one.
-  4. `/name` changes the label without any reload; switching sessions
-     (`/new`/`/resume`) shows the new session's name; non-TUI modes are
-     unaffected.
+  1. Border: as v2 (all 34 mock checks green).
+  2. Footer: byte-identical to the real `FooterComponent` fed the same
+     session with the name hidden (golden differential at widths
+     200/100/60/30); name changes do not affect the custom footer; the
+     real footer does follow renames (proof the masking, not coincidence).
+  3. Single-file footprint: deleting
+     `~/.pi/agent/extensions/session-name-border.ts` restores BOTH the
+     original border and the original footer.
+  4. Non-TUI modes unaffected (setEditorComponent + setFooter are no-ops in
+     the runner; handler is also guarded by `ctx.mode !== "tui"`).
 
 ## 3. Surgical File Map (Strict Scope Boundary)
-- `~/.pi/agent/extensions/session-name-border.ts` — **the extension**
-  (single file, auto-discovered from the global extensions dir):
-  - `capName()` (L ~20–28): 70-column cap + `...`.
-  - `appendSessionName()` (L ~30–70): trailing-dash-run detection on the
-    ANSI line, left-anchored fitting, recomposition with `borderColor`.
-  - `SessionNameEditor extends CustomEditor` (L ~72–90): `render()` override.
-  - default factory: `pi.on("session_start", …)` → `ctx.ui.setEditorComponent`.
+- `~/.pi/agent/extensions/session-name-border.ts` — **the single extension**:
+  - `formatCwd()` — `~` abbreviation (replicated, unexported in pi).
+  - `capName()` — 70-column name cap + `...`.
+  - `appendSessionName()` — trailing-dash-run splice, left-anchored fitting,
+    single colored tail segment.
+  - `SessionNameEditor extends CustomEditor` — `render()` override.
+  - `createNamelessSession(ctx)` — live session shim + name-masking Proxy.
+  - `NamelessFooter` — Component wrapper around the real `FooterComponent`
+    (`render` with last-good-frame fallback, `invalidate`, `dispose`).
+  - factory: `pi.on("session_start", …)` → setEditorComponent + setFooter.
 - `~/.pi/agent/projects/session-name-border/.pi/SPEC.md` — this spec.
-- (read-only refs)
-  - `dist/core/agent-session.js:3241–3246` — `setSessionName` (event emission).
-  - `dist/core/session-manager.js:913–938` — `appendSessionInfo` /
-    `getSessionName` (normalization, empty name clears).
-  - `dist/modes/interactive/interactive-mode.js:2555–2559, 5536–5557` —
-    `/name` handling.
-  - `dist/modes/interactive/interactive-mode.js:2206–2266` —
-    `setCustomEditorComponent` (factory call, state copy-over);
-    `:1777–1780` working indicator → active editor; `:2777–2781` re-render
-    on `session_info_changed`; `updateEditorBorderColor` (dynamic
-    `borderColor`).
-  - `dist/core/extensions/runner.js:153` — `setEditorComponent` no-op in
-    non-TUI runtimes.
-  - pi-tui `dist/components/editor.js:385–391, 185–197, 428` — top border
-    rendering (plain / spinner-embedded via CustomEditor / `↑ N more`
-    variants all end in a trailing `─` run); `render()` returns it as
-    `lines[0]`.
-  - pi-tui exports (verified in `dist/index.d.ts:35`): `visibleWidth`,
-    `truncateToWidth`, `sliceByColumn`, `stripTerminalSequences`.
-  - `examples/extensions/border-status-editor.ts` — official pattern for
-    extending `CustomEditor` + rewriting border lines (reference, not
-    copied: its `fitBorder` truncates the right label from the right first,
-    which would violate the "stuck to the left" rule).
+- `~/.pi/agent/projects/session-name-border/test/` — `test.mjs` (34 mock
+  checks, real CustomEditor + mock theme), `test-real-loader.mjs` (19 checks
+  incl. golden footer differential), `tsconfig.json` (strict vs 1.5.0).
+- (read-only refs — active pi **1.5.0**)
+  - `dist/modes/interactive/components/footer.js` — real `FooterComponent`:
+    `getSessionStats()` (entry scan + `getContextUsage()`), `render()`
+    (pwd/branch/name line, stats line, extension statuses); uses the
+    **module-global** interactive `theme` (needs `initTheme()` outside TUI);
+    `invalidate()`/`dispose()` are no-ops (provider owns the git watcher).
+  - `dist/core/footer-data-provider.d.ts` — `ReadonlyFooterDataProvider =
+    Pick<FooterDataProvider, getGitBranch | getExtensionStatuses |
+    getAvailableProviderCount | onBranchChange>` (what `setFooter` passes).
+  - `dist/modes/interactive/interactive-mode.js:2041-2058` —
+    `setExtensionFooter`: dispose old, clear container, `factory(this.ui,
+    theme, this.footerDataProvider)`, addChild; line 817: its own
+    `onBranchChange` → requestRender (independent of the footer instance).
+  - `dist/core/extensions/runner.js` — `setFooter: () => {}` no-op outside
+    TUI; `createContext()` — **all ExtensionContext values are live
+    getters** ("resolved at call time").
+  - `dist/core/extensions/loader.js` — `loadExtensions(paths, cwd,
+    eventBus?, runtime?)` is **async** and NOT root-exported in 1.5.0.
+  - `Extension.handlers: Map<string, HandlerFn[]>` (array of functions).
 
 ## 4. Atomic Execution Checklist
-- [x] **Step 1:** Recon: verify name storage/event (`session_info`,
-  `session_info_changed`), TUI re-render on that event, editor top-border
-  structure, `setCustomEditorComponent` wiring, pi-tui string utils — done
-  (all line refs above verified against pi 1.4.0 dist).
-- [x] **Step 2:** Write `~/.pi/agent/extensions/session-name-border.ts`.
-  Verify: jiti load + mock-TUI render assertions. **DONE — all green:**
-  - `test/test.mjs` (27 checks, jiti with pi's `getAliases()` mapping,
-    mock TUI/theme/ctx): plain/short/70/71/100-char names, terminal widths
-    3/6/10/60/80/90, working-spinner border, `↑ N more` scroll border,
-    session switch, live `/name` update, whitespace name, CJK width.
-  - `test/test-real-loader.mjs` (pi's real `loadExtensions()` from
-    `dist/core/extensions/loader.js`): zero load errors, handler fires,
-    editor renders `24×─ + " x…x(70)… " + ─` at width 100.
-  - `npx tsc --strict -p test/tsconfig.json` (paths → pi 1.4.0 `.d.ts`):
-    clean, no type errors.
-  - Found & fixed during testing: whitespace-only name rendered a 2-space
-    gap (real `getSessionName()` returns `undefined` for it, but the
-    extension now also guards `visibleWidth(label) === 0`).
-- [ ] **Step 3:** (user) Real-TUI smoke test: `/name short`, `/name` + a
-  100-char name, `/name ''` (clears), long multi-line prompt (scroll
-  indicator), watch while agent works (spinner + name coexist).
-  Re-run harness: `cd ~/.pi/agent/projects/session-name-border/test &&
-  node test.mjs && node test-real-loader.mjs`.
+- [x] **Step 1:** v1 recon (name storage/event, border, editor wiring).
+- [x] **Step 2:** v1 extension + verification (all green).
+- [x] **Step 3 (v2):** `~/path • name` border label, re-verified all green.
+- [x] **Step 4 (v3):** footer override in the same file:
+  - recon: `setFooter` API + `ReadonlyFooterDataProvider` surface;
+    `FooterComponent` root-exported; ExtensionContext live getters;
+    interactive-mode footer wiring (no `invalidate` calls on custom footers).
+  - implementation: `createNamelessSession` + `NamelessFooter` wrapper.
+  - verification (all green vs live pi 1.5.0):
+    - `test.mjs` 34 checks (border: no-name path, short/70/71/100-char,
+      widths 3–100, spinner border, `↑ 8 more` scroll border, session
+      switch, live `/name`, whitespace name, CJK, non-home cwd).
+    - `test-real-loader.mjs` 19 checks: real loader zero errors;
+      **golden differential**: custom footer byte-identical to real
+      `FooterComponent` with masked name at widths 200/100/60/30; rename
+      leaves custom footer unchanged while real footer follows; nameless
+      case byte-identical; dispose ok.
+    - `tsc --strict` vs 1.5.0 `.d.ts`: clean (required adding
+      `invalidate()` to the wrapper — pi-tui `Component` mandates it).
+- [ ] **Step 5 (user):** live-TUI smoke test:
+  - border: `/name short` → `~/… • short`; 100-char name → 70 + `...`;
+    `/name ''` → path alone; narrow terminal; spinner coexistence.
+  - footer: first line shows `~/path (branch)` WITHOUT the name; token
+    stats / context % / status lines look exactly as before; after
+    `/name x` the footer line 1 does not change while the border does.
+  - delete the extension file → both border and footer revert to stock.
 
 ## 5. Negative Knowledge (Guardrails & Taboos)
-- **Do NOT touch:** the bottom border, the footer, the default editor,
-  working-status/scroll-indicator logic, session files, or anything in the
-  LLM context (pure display; no `sendMessage`/`appendEntry`).
-- **Do NOT** register a `session_info_changed` handler for rendering: the
-  TUI already re-renders on it (`interactive-mode.js:2777`); the label is
-  read live in `render()`, so a handler would be redundant.
-- **Do NOT** pass the official example's `fitBorder` approach: it truncates
-  the right-aligned label from the right first under space pressure, which
-  cuts the *beginning* of the name — violates "stuck to the left".
+- **Single file is a hard requirement** (user: deleting the one file must
+  restore original behavior — no companion files).
+- **Do NOT** replicate the footer render logic by hand: wrap the real
+  `FooterComponent` instead — byte-identical by construction and immune to
+  pi footer updates. (Fallback last-good-frame guard covers the case where
+  a future pi change breaks the shim.)
+- **Do NOT** import deep `dist/` paths from the extension (jiti only
+  aliases package roots): `formatCwdForFooter` and `initTheme` stay
+  replicated/absent in the extension; the real `FooterComponent` is fine
+  because it IS root-exported.
+- **Found & fixed (v3):** `capName` dropped the `...` when the 70-column
+  slice landed exactly on 70 cols (the `width < 70` condition) — a 100-char
+  name rendered 70 chars with NO dots. Now: dots always appended whenever
+  `visibleWidth(name) > 70` (the slice is then always a proper prefix).
+- **Found (v3, pi 1.5.0 API drift vs 1.4.0):**
+  - `loadExtensions` no longer root-exported → deep import
+    `dist/core/extensions/loader.js` (tests only); it is now `async`.
+  - `ext.handlers.get(event)` values are `HandlerFn[]` (arrays), not single
+    functions.
+  - pi-tui `Component` **requires** `invalidate()` — missing it fails
+    `tsc` and the `setFooter` signature.
+  - Rendering `FooterComponent` outside the TUI throws "Theme not
+    initialized" until `initTheme()` (deep import
+    `dist/modes/interactive/theme/theme.js`) — tests only; in the real TUI
+    the theme is already initialized.
+- **Known footer-shim limitations (accepted):** no virtual-model routing
+  indicator (`routedModel`), no `(sub)` subscription suffix
+  (`modelRuntime`), `(auto)` always shown (`autoCompactEnabled` not
+  reachable from extensions).
+- **Do NOT** touch: bottom border, session files, LLM context,
+  `sendMessage`/`appendEntry`, working-status/scroll logic, git-branch
+  caching (provider-owned).
+- **Do NOT** add an extension-side `session_info_changed` handler: the TUI
+  already re-renders on it; all label/footer data is read live.
+- **Do NOT** use the official example's `fitBorder` (truncates the wrong
+  side for a left-anchored label).
 - **Do NOT** construct the editor with `paddingX`/`autocompleteMaxVisible`
-  options — `setCustomEditorComponent` copies both from the default editor
-  after construction; only `embedWorkingStatus: true` must be set (it is
-  not copied).
-- **Known pitfall:** the working-status and `↑ N more` border variants are
-  built with *separate* `borderColor` segments (spinner text can be colored
-  differently); always splice by visible columns (`sliceByColumn`), never by
-  string index.
-- **Known pitfall:** `getSessionName()` returns `undefined` for an empty
-  (whitespace-only) name — treat as "no name", matching `/name` semantics.
+  (copied from the default editor by `setCustomEditorComponent`); only
+  `embedWorkingStatus: true` must be set explicitly.
+- **Known pitfall:** working-status / `↑ N more` border variants are built
+  from separate colored segments → splice by visible columns
+  (`sliceByColumn`), never string indices.
+- **Known pitfall:** the top border's trailing `─` run is the ONLY region
+  to splice into; everything before it (spinner, scroll indicator) must
+  stay byte-identical.
 
 ## 6. Next Immediate Action
-- **Target File & Lines:** `~/.pi/agent/extensions/session-name-border.ts`
-  (whole file — not yet written).
-- **Next Command:** write the extension file, then run the jiti-based
-  render-assertion test harness (mock TUI `{ terminal: { rows: 40 } }`,
-  mock theme `borderColor`, mock `ctx.sessionManager.getSessionName`).
+- **Target:** code complete and verified (v3). Nothing pending.
+- **Next Command:** user live-TUI smoke test (Step 5), then delete-file
+  revert check. Re-run harness any time:
+  `cd ~/.pi/agent/projects/session-name-border/test && node test.mjs &&
+  node test-real-loader.mjs` (tsc: `cd /tmp/snb-test &&
+  ./node_modules/.bin/tsc -p ../.../test/tsconfig.json`).

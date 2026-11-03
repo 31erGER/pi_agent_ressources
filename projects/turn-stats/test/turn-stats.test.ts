@@ -16,17 +16,20 @@ process.env.TZ = "UTC"; // deterministic clock formatting (must run before any f
 import { Box } from "@earendil-works/pi-tui";
 import turnStatsExt, {
   type TurnStatsData,
-  type TurnTracker,
   addUsage,
   finishTurn,
   formatClock,
   formatCost,
   formatDuration,
+  formatLiveLine,
   formatNumber,
   formatTurnLine,
+  liveStats,
   startTurn,
   tokensPerSec,
 } from "../../../extensions/turn-stats.ts";
+
+const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
 
 let failures = 0;
 let passed = 0;
@@ -158,6 +161,41 @@ const T1 = Date.parse("2025-11-03T14:32:05.000Z"); // T0 + 42.3s later? -> 65s; 
   );
 }
 
+// liveStats (v2)
+{
+  const t = startTurn(T0);
+  addUsage(t, { input: 1000, output: 200 });
+  const s = liveStats(t, T0 + 10_000, { input: 500, output: 50 });
+  check(
+    "liveStats: sums completed + in-flight usage, elapsed + tps",
+    s.elapsedMs === 10_000 && s.input === 1500 && s.output === 250 && Math.abs(s.tokensPerSec - 25) < 1e-9,
+    JSON.stringify(s),
+  );
+  const s0 = liveStats(t, T0, null);
+  check(
+    "liveStats: zero elapsed -> 0 tps, no live usage",
+    s0.elapsedMs === 0 && s0.tokensPerSec === 0 && s0.input === 1000 && s0.output === 200,
+    JSON.stringify(s0),
+  );
+  const s2 = liveStats(t, T0 - 5000, { output: 7 });
+  check("liveStats: negative elapsed clamped, tps 0", s2.elapsedMs === 0 && s2.tokensPerSec === 0 && s2.output === 207);
+}
+
+// formatLiveLine (v2)
+{
+  const line = formatLiveLine({ elapsedMs: 12_400, input: 12_340, output: 567, tokensPerSec: 45.7 });
+  check(
+    "formatLiveLine: exact line",
+    line === "⏱ 12.4s · ↑ 12,340 in · ↓ 567 out · 45.7 tok/s",
+    line,
+  );
+  check(
+    "formatLiveLine: sub-second elapsed",
+    formatLiveLine({ elapsedMs: 900, input: 10, output: 2, tokensPerSec: 0 }) === "⏱ <1s · ↑ 10 in · ↓ 2 out · 0.0 tok/s",
+    formatLiveLine({ elapsedMs: 900, input: 10, output: 2, tokensPerSec: 0 }),
+  );
+}
+
 // ── Part 2: integration with a mock ExtensionAPI ─────────────────────────────
 
 interface MockPi {
@@ -167,10 +205,13 @@ interface MockPi {
   handlers: Map<string, Array<(...args: unknown[]) => unknown>>;
   entries: Array<{ customType: string; data: unknown }>;
   renderer: ((...args: unknown[]) => unknown) | null;
+  widgetCalls: Array<{ key: string; value: unknown }>;
+  ctx: { hasUI: boolean; ui: { setWidget(key: string, value: unknown, options?: unknown): void } };
 }
 
-function makeMockPi(hasUI: boolean): MockPi & { ctx: { hasUI: boolean } } {
+function makeMockPi(hasUI: boolean): MockPi {
   const handlers = new Map<string, Array<(...args: unknown[]) => unknown>>();
+  const widgetCalls: Array<{ key: string; value: unknown }> = [];
   const pi: MockPi = {
     on(event, handler) {
       const list = handlers.get(event) ?? [];
@@ -191,12 +232,21 @@ function makeMockPi(hasUI: boolean): MockPi & { ctx: { hasUI: boolean } } {
     handlers,
     entries: [],
     renderer: null,
+    widgetCalls,
+    ctx: {
+      hasUI,
+      ui: {
+        setWidget(key: string, value: unknown) {
+          widgetCalls.push({ key, value });
+        },
+      },
+    },
   };
-  return Object.assign(pi, { ctx: { hasUI } });
+  return pi;
 }
 
 async function fire(pi: MockPi, event: string, ...args: unknown[]): Promise<void> {
-  const ctx = (pi as MockPi & { ctx: unknown }).ctx;
+  const ctx = pi.ctx;
   for (const h of pi.handlers.get(event) ?? []) {
     const r = h(...args, ctx);
     if (r && typeof (r as Promise<unknown>).then === "function") await r;
@@ -334,6 +384,69 @@ const theme = {
     rendered2.includes("cache read 123") && rendered2.includes("model calls"), rendered2);
   const box3 = render({ customType: "turn-stats", data: undefined }, { expanded: false }, theme) as Box;
   check("renderer: missing data renders without throwing", box3 instanceof Box);
+}
+
+// live widget lifecycle (v2)
+{
+  const pi = makeMockPi(true);
+  turnStatsExt(pi as never, { tickMs: 5 });
+
+  await fire(pi, "agent_start", {});
+  await sleep(30);
+  const shown = pi.widgetCalls.filter((c) => c.value !== undefined);
+  check("widget: set above editor while turn runs (key turn-stats)",
+    shown.length >= 1 && shown.every((c) => c.key === "turn-stats"),
+    JSON.stringify(pi.widgetCalls));
+  const firstLine = Array.isArray(shown[0]?.value) ? String((shown[0].value as string[])[0]) : String(shown[0]?.value);
+  check("widget: line has elapsed/in/out/tok-s",
+    /⏱ .+ in · .+ out · .+ tok\/s/.test(firstLine), firstLine);
+
+  await fire(pi, "message_end", { message: assistantMsg({ input: 4000, output: 80, cost: { total: 0 } }) });
+  await sleep(30);
+  const lineAfterMsg = [...pi.widgetCalls].reverse().find((c) => c.value !== undefined);
+  const lineAfterMsgText = Array.isArray(lineAfterMsg?.value) ? String((lineAfterMsg.value as string[])[0]) : String(lineAfterMsg?.value);
+  check("widget: live line reflects completed usage",
+    lineAfterMsgText.includes("↑ 4,000 in") && lineAfterMsgText.includes("↓ 80 out"), lineAfterMsgText);
+
+  await fire(pi, "message_update", { message: { role: "assistant", usage: { input: 100, output: 30 } } });
+  await sleep(30);
+  const lineLive = [...pi.widgetCalls].reverse().find((c) => c.value !== undefined);
+  const lineLiveText = Array.isArray(lineLive?.value) ? String((lineLive.value as string[])[0]) : String(lineLive?.value);
+  check("widget: partial in-flight usage included",
+    lineLiveText.includes("↓ 110 out") && lineLiveText.includes("↑ 4,100 in"), lineLiveText);
+
+  const callsBeforeSettle = pi.widgetCalls.length;
+  await fire(pi, "agent_settled", { aborted: false });
+  check("widget: cleared at settle (setWidget undefined)",
+    pi.widgetCalls.slice(callsBeforeSettle).some((c) => c.value === undefined),
+    JSON.stringify(pi.widgetCalls.slice(callsBeforeSettle)));
+  const entry = pi.entries[0]?.data as TurnStatsData | undefined;
+  check("widget: final entry still appended (completed usage only)",
+    pi.entries.length === 1 && !!entry && entry.output === 80 && entry.input === 4000, JSON.stringify(entry));
+
+  await sleep(30);
+  check("widget: ticker stopped after settle (no further updates)",
+    pi.widgetCalls.length === callsBeforeSettle + 1,
+    String(pi.widgetCalls.length));
+
+  // a fresh turn shows the widget again
+  await fire(pi, "agent_start", {});
+  await sleep(30);
+  check("widget: re-shown for next turn",
+    pi.widgetCalls.filter((c) => c.value !== undefined).length > shown.length,
+    String(pi.widgetCalls.length));
+  await fire(pi, "agent_settled", { aborted: false }); // no usage -> no entry, widget cleared
+  check("widget: cleared again after no-usage turn", pi.widgetCalls.some((c, i) => i > 0 && c.value === undefined));
+}
+
+{ // hasUI=false: widget is never touched, nothing leaks
+  const pi = makeMockPi(false);
+  turnStatsExt(pi as never, { tickMs: 5 });
+  await fire(pi, "agent_start", {});
+  await fire(pi, "message_end", { message: assistantMsg({ input: 10, output: 3 }) });
+  await fire(pi, "agent_settled", { aborted: false });
+  await sleep(20);
+  check("hasUI=false: widget never touched", pi.widgetCalls.length === 0, JSON.stringify(pi.widgetCalls));
 }
 
 // ── summary ──────────────────────────────────────────────────────────────────

@@ -72,3 +72,59 @@
 - **Target File & Lines:** `~/.pi/agent/extensions/turn-stats.ts` (NEW, whole file)
 - **Next Command:** implement extension, then run
   `node ~/.pi/agent/projects/turn-stats/test/turn-stats.test.ts`
+
+## 7. v2 — Live stats above the input while the turn runs
+
+### 7.1 Human Requirement (Original Intent)
+> While the turn runs, show the same quick stats (elapsed time, in/out tokens,
+> tok/s) right above the chat input field, sticky (pinned, not scrolling with
+> the chat), close to how Claude Code handles it.
+
+### 7.2 Architecture & Data Flow
+- **Core Mechanism:** On a new turn's `agent_start` the extension starts a
+  250 ms ticker that pushes the live line to `ctx.ui.setWidget("turn-stats",
+  [line])` — the default widget placement is above the editor/input. The line
+  is only re-set when it actually changes. Live numbers come from the tracker
+  plus the in-flight message's partial `usage` (captured from
+  `message_start`/`message_update`; providers differ in what they stream, so
+  everything is defensive — worst case the line shows tokens of completed
+  messages only). On `agent_settled`/`session_shutdown` the ticker stops, the
+  widget is cleared (`setWidget(key, undefined)`), and the final chat line from
+  v1 is appended as before.
+- **Data / Control Flow:**
+  `agent_start(new turn) -> ticker.start + setWidget`
+  `message_start/update(assistant) -> liveUsage = message.usage (if present)`
+  `ticker(250ms) -> formatLiveLine(liveStats(tracker, now, liveUsage)) -> setWidget (only on change)`
+  `message_end(assistant) -> addUsage(tracker, final); liveUsage = null`
+  `agent_settled / session_shutdown -> ticker.stop + setWidget(undefined) + (settle: appendEntry)`
+- **Acceptance Criteria:**
+  1. While a turn runs, a sticky line above the input shows
+     `⏱ <elapsed> · ↑ <in> in · ↓ <out> out · <x> tok/s`, updating live.
+  2. The widget is removed as soon as the turn settles (or the session
+     shuts down); the final stats line in the chat still appears (v1 behavior).
+  3. No ticker/widget activity in print/json mode (hasUI=false); no leaked
+     intervals after settle/shutdown (pi must be able to exit).
+  4. `liveStats`/`formatLiveLine` are exported pure functions, unit-tested;
+     integration test asserts the mock `ui.setWidget` is fed live lines and
+     cleared at settle.
+
+### 7.3 Checklist (v2)
+- [x] **S1:** SPEC updated (this section) — verify: file read
+- [x] **S2 (CURRENT):** RED — add live-core + widget integration tests to
+      `test/turn-stats.test.ts` — verify: `node test/turn-stats.test.ts` fails
+      (missing `liveStats`/`formatLiveLine`, no setWidget calls)
+- [x] **S3:** GREEN — extend `turn-stats.ts` (ticker, liveUsage capture, widget
+      lifecycle) — verify: `node test/turn-stats.test.ts` passes
+- [x] **S4:** typecheck + loader-check — verify: `npm run typecheck`,
+      `npm run loader-check` clean
+
+### 7.4 Negative Knowledge (v2)
+- **Partial `usage` is provider-dependent** (e.g. Anthropic reports input
+  tokens early, output at the end; some providers stream none) → always fall
+  back to completed-message totals; never block on usage.
+- **Never call `setWidget` per token** (`message_update` is high-frequency);
+  rendering happens only on the ticker, and only when the line changed.
+- **The ticker must be cleared on `agent_settled` AND `session_shutdown`**,
+  otherwise a ref'd interval keeps the pi process alive.
+- Widget key is `"turn-stats"` (same namespace as the custom entry type);
+  `setWidget(key, undefined)` clears it.

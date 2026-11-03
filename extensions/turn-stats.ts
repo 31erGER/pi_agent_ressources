@@ -26,11 +26,20 @@
  * is written for runs without assistant usage, and nothing is appended in
  * print/json mode (no chat to render into).
  *
+ * v2 — live stats while the turn runs: a sticky one-line widget above the
+ * chat input (ctx.ui.setWidget, default placement) updated by a 250 ms
+ * ticker shows elapsed time, tokens so far and tok/s so far. In-flight
+ * tokens come from the streaming partial message's usage when the provider
+ * reports it (message_start/message_update); otherwise the line only moves
+ * when a message completes. The widget is cleared on agent_settled /
+ * session_shutdown — the ticker interval is always stopped, so it can never
+ * keep the process alive.
+ *
  * Auto-loaded from ~/.pi/agent/extensions/. Pure core (startTurn/addUsage/
- * finishTurn/formatters) is exported and unit-tested in
+ * finishTurn/liveStats/formatters) is exported and unit-tested in
  * ~/.pi/agent/projects/turn-stats/test/turn-stats.test.ts.
  */
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Box, Text } from "@earendil-works/pi-tui";
 
 // ── Types ────────────────────────────────────────────────────────────────────
@@ -67,6 +76,7 @@ export interface TurnStatsData {
 }
 
 const CUSTOM_TYPE = "turn-stats";
+const WIDGET_KEY = "turn-stats";
 
 // ── Pure core (unit-tested) ──────────────────────────────────────────────────
 
@@ -147,36 +157,128 @@ export function formatTurnLine(d: TurnStatsData): string {
   return parts.join(" · ");
 }
 
+/** Live snapshot of the turn in progress (completed usage + in-flight partial). */
+export interface LiveTurnStats {
+  elapsedMs: number;
+  input: number;
+  output: number;
+  tokensPerSec: number;
+}
+
+export function liveStats(t: TurnTracker, now: number, live: TurnUsageLike | null = null): LiveTurnStats {
+  const elapsedMs = Math.max(0, now - t.startedAt);
+  const input = t.input + (live?.input ?? 0);
+  const output = t.output + (live?.output ?? 0);
+  return { elapsedMs, input, output, tokensPerSec: elapsedMs <= 0 ? 0 : output / (elapsedMs / 1000) };
+}
+
+/** The sticky one-line widget rendering of the turn in progress. */
+export function formatLiveLine(s: LiveTurnStats): string {
+  return `⏱ ${formatDuration(s.elapsedMs)} · ↑ ${formatNumber(s.input)} in · ↓ ${formatNumber(s.output)} out · ${s.tokensPerSec.toFixed(1)} tok/s`;
+}
+
 // ── Extension ────────────────────────────────────────────────────────────────
 
-export default function (pi: ExtensionAPI): void {
+export interface TurnStatsOptions {
+  /** Ticker interval for the live widget (tests use small values). Default 250 ms. */
+  tickMs?: number;
+}
+
+const DEFAULT_TICK_MS = 250;
+
+export default function (pi: ExtensionAPI, options: TurnStatsOptions = {}): void {
+  const tickMs = options.tickMs ?? DEFAULT_TICK_MS;
+
   /** Currently tracked turn, or null when idle. */
   let turn: TurnTracker | null = null;
+  /** Usage of the in-flight assistant message, when the provider streams it. */
+  let liveUsage: TurnUsageLike | null = null;
+  let ticker: ReturnType<typeof setInterval> | null = null;
+  let lastCtx: ExtensionContext | null = null;
+  let lastLine: string | null = null;
 
-  pi.on("agent_start", () => {
+  const refresh = (ctx: ExtensionContext): void => {
+    if (!turn || !ctx.hasUI) return;
+    const line = formatLiveLine(liveStats(turn, Date.now(), liveUsage));
+    if (line !== lastLine) { // don't re-set the widget unless something changed
+      lastLine = line;
+      ctx.ui.setWidget(WIDGET_KEY, [line]);
+    }
+  };
+
+  const startTicker = (ctx: ExtensionContext): void => {
+    if (ticker || !ctx.hasUI) return;
+    lastCtx = ctx;
+    lastLine = null;
+    refresh(ctx);
+    ticker = setInterval(() => refresh(lastCtx ?? ctx), tickMs);
+  };
+
+  const stopTicker = (ctx: ExtensionContext): void => {
+    if (ticker) {
+      clearInterval(ticker);
+      ticker = null;
+    }
+    lastLine = null;
+    if (ctx.hasUI) ctx.ui.setWidget(WIDGET_KEY, undefined); // remove the sticky line
+  };
+
+  pi.on("agent_start", (_event, ctx) => {
+    lastCtx = ctx;
     // A continuation (retry / auto-compaction / queued follow-up) starts a new
-    // low-level run for the SAME turn: keep the existing accumulator.
-    if (!turn) turn = startTurn(Date.now());
+    // low-level run for the SAME turn: keep the existing accumulator + ticker.
+    if (!turn) {
+      turn = startTurn(Date.now());
+      liveUsage = null;
+      startTicker(ctx);
+    }
   });
 
-  pi.on("message_end", (event) => {
+  pi.on("message_start", (event, ctx) => {
+    lastCtx = ctx;
+    const m = event.message;
+    if (!turn) return;
+    // New assistant message: drop the previous in-flight usage; keep whatever
+    // the provider already reported on the partial (e.g. Anthropic input tokens).
+    if (m && m.role === "assistant") liveUsage = m.usage ?? null;
+  });
+
+  pi.on("message_update", (event, ctx) => {
+    lastCtx = ctx;
+    const m = event.message;
+    if (!turn) return;
+    // High-frequency: only capture, never render (the ticker does that).
+    if (m && m.role === "assistant" && m.usage) liveUsage = m.usage;
+  });
+
+  pi.on("message_end", (event, ctx) => {
+    lastCtx = ctx;
     if (!turn) return;
     const m = event.message;
-    if (m && m.role === "assistant") addUsage(turn, m.usage);
+    if (m && m.role === "assistant") {
+      addUsage(turn, m.usage);
+      liveUsage = null; // final usage is now in the tracker
+    }
   });
 
   pi.on("agent_settled", (event, ctx) => {
+    lastCtx = ctx;
+    stopTicker(ctx);
     if (!turn) return;
     const t = turn;
     turn = null;
+    liveUsage = null;
     if (t.modelCalls === 0) return; // run produced no model usage — nothing to report
     if (!ctx.hasUI) return; // print/json mode: no chat transcript to render into
     pi.appendEntry(CUSTOM_TYPE, finishTurn(t, Date.now(), event.aborted === true));
   });
 
-  // A session switch/quit/reload mid-run must not leak the in-flight accumulator.
-  pi.on("session_shutdown", () => {
+  // A session switch/quit/reload mid-run must not leak the accumulator, the
+  // in-flight usage or the ticker interval (or pi would not exit).
+  pi.on("session_shutdown", (_event, ctx) => {
+    stopTicker(ctx);
     turn = null;
+    liveUsage = null;
   });
 
   pi.registerEntryRenderer<TurnStatsData>(CUSTOM_TYPE, (entry, { expanded }, theme) => {
