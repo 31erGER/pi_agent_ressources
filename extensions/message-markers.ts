@@ -208,6 +208,30 @@ function isStopped(tui: TUI): boolean {
 }
 
 /**
+ * Build a live theme reader for a session's ctx that survives session
+ * replacement. The captured ctx goes stale the moment pi swaps sessions
+ * (newSession / fork / switchSession / reload) — the old ctx's `ui` getter
+ * then throws (ExtensionRunner.assertActive). TUI render frames can run
+ * during that replacement window (before the replacement's session_start
+ * re-captures a fresh ctx), and the rail composites markers on EVERY frame —
+ * a throw there crashes the whole process (see crashes.json). So this getter
+ * never throws: it falls back to the last successfully read theme
+ * (fallbackTheme before the first read) and picks up live theme changes
+ * again as soon as the ctx is active.
+ */
+function makeThemeReader(ctx: { ui: { theme: unknown } }): () => RailTheme {
+	let last: RailTheme = fallbackTheme;
+	return () => {
+		try {
+			last = ctx.ui.theme as unknown as RailTheme;
+		} catch {
+			// stale ctx (session replacement in flight): keep the last theme
+		}
+		return last;
+	};
+}
+
+/**
  * Marker rail: one line per marker, composited onto the right side of the
  * rendered transcript document, vertically centered over the visible part
  * of the transcript viewport.
@@ -485,6 +509,14 @@ function patchAltScreenStart(onStart: (tui: TUI) => void): void {
 // Extension entry
 // ---------------------------------------------------------------------------
 
+let testState: RailState | null = null;
+
+/** Test-only: the RailState of the most recent default-export invocation. */
+export function railStateForTests(): RailState {
+	if (!testState) throw new Error("extension entry not loaded yet");
+	return testState;
+}
+
 export default function (pi: ExtensionAPI): void {
 	const state: RailState = {
 		enabled: true,
@@ -495,6 +527,7 @@ export default function (pi: ExtensionAPI): void {
 		cacheKey: null,
 		offsets: [],
 	};
+	testState = state;
 	const rail = new MarkerRail(state);
 
 	// (a) Catch every newly started fullscreen TUI (mode switches, startup).
@@ -502,7 +535,7 @@ export default function (pi: ExtensionAPI): void {
 
 	pi.on("session_start", (_event, ctx) => {
 		if (ctx.mode !== "tui") return;
-		state.getTheme = () => ctx.ui.theme as unknown as RailTheme;
+		state.getTheme = makeThemeReader(ctx);
 		if (!state.enabled) return;
 		// (b) Capture the live TUI. Covers the initial TUI, which starts
 		// before extensions load. done() is called synchronously in the
@@ -546,7 +579,7 @@ export default function (pi: ExtensionAPI): void {
 			}
 			if (arg === "on") {
 				state.enabled = true;
-				state.getTheme = () => ctx.ui.theme as unknown as RailTheme;
+				state.getTheme = makeThemeReader(ctx);
 				void ctx.ui.custom((tui, _theme, _keybindings, done) => {
 					try {
 						installRail(tui, state, rail);

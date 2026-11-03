@@ -11,6 +11,7 @@ import { TuiAltScreen, type TUI } from "@earendil-works/pi-tui";
 import defaultExport, {
 	installRail,
 	MarkerRail,
+	railStateForTests,
 	type RailState,
 } from "../../../extensions/message-markers.ts";
 
@@ -156,6 +157,46 @@ await test("/markers in rpc mode notifies an error and does not crash", async ()
 	await commands["markers"].handler("status", ctxStub("rpc"));
 	assert.ok(notifications.length > before);
 	assert.ok(notifications.slice(before).some((n) => /interactive mode/i.test(n)));
+});
+
+await test("overlay: stale captured ctx (session-replacement window) must not crash the render path", async () => {
+	const ctx1 = ctxStub("tui");
+	sessionHandlers.at(-1)?.({ reason: "startup" }, ctx1);
+	const state = railStateForTests();
+	state.enabled = true;
+	state.activeTui = fakeTui;
+	const userMsg = { text: "hello", markdownTransformers: [] };
+	state.transcript = {
+		child: { children: [userMsg] },
+		scrollTop: 0,
+		viewportHeight: 10,
+	} as unknown as RailState["transcript"];
+	// The session was replaced: the captured ctx is stale and its `ui`
+	// getter now throws — exactly what ExtensionRunner.assertActive does.
+	Object.defineProperty(ctx1, "ui", {
+		configurable: true,
+		get() {
+			throw new Error("This extension ctx is stale after session replacement or reload.");
+		},
+	});
+	const rail = new MarkerRail(state);
+	const lines = new Array(10).fill("");
+	const out = rail.overlay(lines, 80); // pre-fix: throws the stale error
+	assert.equal(out.length, 10);
+	assert.ok(out.some((l) => l.includes("▸")), "marker rendered with the last known (fallback) theme");
+});
+
+await test("getTheme recovers: the replacement's fresh session_start ctx is used again", async () => {
+	const ctx2 = ctxStub("tui");
+	// fg must return a 2-visible-column mark (compositeTuiLine clips to 2 cols).
+	(ctx2.ui as { theme: { fg: (c: string, t?: string) => string } }).theme = {
+		fg: () => "◆ ",
+	};
+	sessionHandlers.at(-1)?.({ reason: "resume" }, ctx2);
+	const state = railStateForTests();
+	const lines = new Array(10).fill("");
+	const out = new MarkerRail(state).overlay(lines, 80);
+	assert.ok(out.some((l) => l.includes("◆")), "new ctx theme used after replacement");
 });
 
 await test("installRail: disabled state short-circuits before touching the TUI", () => {

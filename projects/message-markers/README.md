@@ -75,6 +75,20 @@ transcript viewport. Plain typing and other keys are unaffected; when the rail i
 - **Exception-safe:** every install path is wrapped in try/catch; a failure only
   disables the rail (and, when `MESSAGE_MARKERS_DEBUG` is set, logs to the debug file).
   The session and TUI keep running regardless.
+- **Stale-ctx pitfall (fixed 2026-11-03):** the theme is read through the session's
+  `ctx` (`ctx.ui.theme`), and that ctx is **invalidated the moment pi replaces the
+  session** (resume / new / fork / reload) — the old ctx's `ui` getter then throws
+  (ExtensionRunner.assertActive). The rail composites markers on **every render
+  frame**, and TUI frames can run during the replacement window (before the new
+  session's `session_start` re-captures), so a bare `() => ctx.ui.theme` closure
+  crashed the whole process on session resume (uncaught exception in the render
+  loop; see `~/.pi/agent/crashes.json`, 5 entries, pi 1.5.0). The theme is now read
+  through `makeThemeReader(ctx)`: live reads while the ctx is active, fallback to the
+  last successfully read theme (fallbackTheme before the first read) while stale,
+  and it picks up live theme changes again once the replacement's `session_start`
+  re-captures a fresh ctx. Rule: **never let a render-path closure hold a session
+  ctx**; treat any ctx captured at `session_start` as stale from the next session
+  swap until a new one arrives.
 
 ## Limitations
 
@@ -106,7 +120,8 @@ node ~/.pi/agent/projects/message-markers/tests/message-markers.load-smoke.ts
 python3 ~/.pi/agent/projects/message-markers/tests/message-markers.pty-e2e.py
 ```
 
-All three pass on pi 1.5.0 (2026-11-03): 19/19 unit, 8/8 smoke, 5/5 e2e.
+All three pass on pi 1.5.0 (2026-11-03): 19/19 unit, 10/10 smoke (incl. the
+stale-ctx render regression tests), 5/5 e2e.
 
 ## Files
 
