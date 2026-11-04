@@ -1,12 +1,12 @@
 {
   "qwen/qwen3.8-27b": {
     "off": "none",
-    "minimal": "low",
+    "minimal": null,
     "low": "low",
     "medium": "medium",
-    "high": "xhigh",
+    "high": null,
     "xhigh": "xhigh",
-    "max": "xhigh"
+    "max": null
   },
   "26b@q4_0": {
     "off": "none",
