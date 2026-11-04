@@ -1,0 +1,65 @@
+{
+  "qwen/qwen3.8-27b": {
+    "off": "none",
+    "minimal": "low",
+    "low": "low",
+    "medium": "medium",
+    "high": "xhigh",
+    "xhigh": "xhigh",
+    "max": "xhigh"
+  },
+  "26b@q4_0": {
+    "off": "none",
+    "minimal": "minimal",
+    "low": "low",
+    "medium": "medium",
+    "high": "high",
+    "xhigh": "xhigh",
+    "max": "xhigh"
+  },
+  "26b@q6_k_xl": {
+    "off": "none",
+    "minimal": "minimal",
+    "low": "low",
+    "medium": "medium",
+    "high": "high",
+    "xhigh": "xhigh",
+    "max": "xhigh"
+  },
+  "26b@?": {
+    "off": "none",
+    "minimal": "minimal",
+    "low": "low",
+    "medium": "medium",
+    "high": "high",
+    "xhigh": "xhigh",
+    "max": "xhigh"
+  },
+  "12b": {
+    "off": "none",
+    "minimal": "minimal",
+    "low": "low",
+    "medium": "medium",
+    "high": "high",
+    "xhigh": "xhigh",
+    "max": "xhigh"
+  },
+  "lfm": {
+    "off": "none",
+    "minimal": "minimal",
+    "low": "low",
+    "medium": "medium",
+    "high": "high",
+    "xhigh": "xhigh",
+    "max": "xhigh"
+  },
+  "k2 horizon": {
+    "off": "none",
+    "minimal": "minimal",
+    "low": "low",
+    "medium": "medium",
+    "high": "high",
+    "xhigh": "xhigh",
+    "max": "xhigh"
+  }
+}
