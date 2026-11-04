@@ -95,7 +95,7 @@ Create or iterate `.pi/PLAN.md`, or the latest increment, using this exact struc
 - **Next Command:** [Exact `read` or `edit` action to start Step 1]
 ~~~
 
-/////////////////////////////////////////////////////
+
 ## Phase 5: Handoff, Termination & Lock-in
 
 Once `.pi/PLAN.md`, or the latest increment, has been successfully written and validated, you must immediately halt all autonomous execution:
@@ -104,4 +104,3 @@ Once `.pi/PLAN.md`, or the latest increment, has been successfully written and v
 3. **Explicit Handoff Output:** Output **only** the following clear completion prompt to the user and wait for their explicit go-ahead:
 
 *"I have translated your request into a rigorous technical implementation plan in `.pi/PLAN.md`. Should I proceed with Step 1?"*
-/////////////////////////////////////////////////////
