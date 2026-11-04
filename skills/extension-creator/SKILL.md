@@ -11,4 +11,4 @@ description: Gives guidlines for usual steps when be asked to generate a new ext
 
 **Steps:**
 
-Load the vibe-to-spec skill and expect the task/topic with the user Prompt included.
+Load the plam skill and expect the task/topic with the user Prompt included.
