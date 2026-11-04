@@ -18,15 +18,28 @@
  * - Server URL: $LM_STUDIO_BASE_URL (default http://localhost:1234).
  *
  * /lmstudio re-reads the model list from the server at any time.
+ *
+ * Effort mapping (projects/lmstudio/efforts.json):
+ *   Per-model map of pi thinking levels (off|minimal|low|medium|high|xhigh|max) to the
+ *   `reasoning_effort` value sent in the request JSON. A default entry is auto-created
+ *   for every newly loaded model; user edits win, missing levels are backfilled with
+ *   the defaults, stale entries are kept, null disables a level. LM Studio 0.4.28
+ *   supported values: none, minimal, low, medium, high, xhigh. Only applies to models
+ *   detected as reasoning (thinkingLevelMap + supportsReasoningEffort); plain models
+ *   never receive the field. Override the path via $LM_STUDIO_EFFORTS_FILE.
+ *   Logic: projects/lmstudio/lmstudio-efforts.ts (unit-tested).
  */
 import type { ExtensionAPI, ProviderModelConfig } from "@earendil-works/pi-coding-agent";
 import { trackExtensionRun } from "./stats.ts"; // global usage counter (stats extension)
+import { ensureModels, entryToThinkingLevelMap, effortsFileUrl } from "../projects/lmstudio/lmstudio-efforts.ts";
+import type { EffortsFile } from "../projects/lmstudio/lmstudio-efforts.ts";
 
 const PROVIDER_ID = "lmstudio";
 const DEFAULT_BASE_URL = "http://localhost:1234";
 const DEFAULT_CONTEXT_WINDOW = 125000;
 const DEFAULT_MAX_TOKENS = 65536;
 const STARTUP_TIMEOUT_MS = 3000;
+const EFFORTS_URL = effortsFileUrl(import.meta.url); // projects/lmstudio/efforts.json (or $LM_STUDIO_EFFORTS_FILE)
 
 const REASONING_MODEL_PATTERNS = [
   /qwen\s*3/i,
@@ -88,11 +101,32 @@ async function fetchCatalog(signal: AbortSignal): Promise<LmStudioModel[]> {
   }
 }
 
-function toModelConfig(entry: LmStudioModel): ProviderModelConfig | null {
-  if (typeof entry.id !== "string" || entry.id.length === 0) return null;
+// OpenAI-compatible chat compat; reasoning models additionally get
+// `reasoning_effort` support (values come from the efforts.json mapping).
+const PLAIN_COMPAT = {
+  supportsStore: false,
+  supportsDeveloperRole: false,
+  supportsReasoningEffort: false,
+  supportsUsageInStreaming: true,
+  supportsStrictMode: false,
+  maxTokensField: "max_tokens",
+};
+const REASONING_EFFORT_COMPAT = { ...PLAIN_COMPAT, supportsReasoningEffort: true };
+
+function isChatModelEntry(entry: LmStudioModel): boolean {
+  if (typeof entry.id !== "string" || entry.id.length === 0) return false;
   const type = entry.type ?? "llm";
-  if (type !== "llm" && type !== "vlm") return null; // skip embeddings & co.
-  if (entry.publisher === "Image") return null; // skip image-generation models
+  if (type !== "llm" && type !== "vlm") return false; // skip embeddings & co.
+  return entry.publisher !== "Image"; // skip image-generation models
+}
+
+function chatModelIds(catalog: LmStudioModel[]): string[] {
+  return catalog.filter(isChatModelEntry).map((entry) => entry.id);
+}
+
+function toModelConfig(entry: LmStudioModel, efforts?: EffortsFile): ProviderModelConfig | null {
+  if (!isChatModelEntry(entry)) return null;
+  const type = entry.type ?? "llm";
 
   const loaded = entry.state === "loaded";
   let contextWindow: number;
@@ -113,20 +147,16 @@ function toModelConfig(entry: LmStudioModel): ProviderModelConfig | null {
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
     contextWindow,
     maxTokens,
-    compat: {
-      supportsStore: false,
-      supportsDeveloperRole: false,
-      supportsReasoningEffort: false,
-      supportsUsageInStreaming: true,
-      supportsStrictMode: false,
-      maxTokensField: "max_tokens",
-    },
+    compat: reasoning ? REASONING_EFFORT_COMPAT : PLAIN_COMPAT,
+    // Reasoning models only: per-level `reasoning_effort` values from efforts.json
+    // (missing/null level -> null -> level hidden from the UI, never sent).
+    ...(reasoning ? { thinkingLevelMap: entryToThinkingLevelMap(efforts?.[entry.id]) } : {}),
   };
 }
 
-function toConfigs(catalog: LmStudioModel[]): ProviderModelConfig[] {
+function toConfigs(catalog: LmStudioModel[], efforts: EffortsFile): ProviderModelConfig[] {
   return catalog
-    .map(toModelConfig)
+    .map((entry) => toModelConfig(entry, efforts))
     .filter((m): m is ProviderModelConfig => m !== null);
 }
 
@@ -136,7 +166,8 @@ export default async (pi: ExtensionAPI) => {
   let initial: ProviderModelConfig[] = [];
   try {
     const signal = AbortSignal.timeout(STARTUP_TIMEOUT_MS);
-    initial = toConfigs(await fetchCatalog(signal));
+    const catalog = await fetchCatalog(signal);
+    initial = toConfigs(catalog, await ensureModels(EFFORTS_URL, chatModelIds(catalog)));
   } catch {
     // leave empty; the picker refresh will retry
   }
@@ -152,7 +183,7 @@ export default async (pi: ExtensionAPI) => {
       try {
         const catalog = await fetchCatalog(context.signal);
         if (context.signal.aborted) return initial;
-        const refreshed = toConfigs(catalog);
+        const refreshed = toConfigs(catalog, await ensureModels(EFFORTS_URL, chatModelIds(catalog)));
         return refreshed.length > 0 ? refreshed : initial;
       } catch {
         return initial; // keep the stale list rather than dropping models
