@@ -1,11 +1,11 @@
 /**
- * data-guard.ts — pi extension
+ * confirmation-dialog.ts — pi extension
  *
- * Install:  mkdir -p ~/.pi/agent/extensions && cp data-guard.ts ~/.pi/agent/extensions/
+ * Install:  mkdir -p ~/.pi/agent/extensions && cp confirmation-dialog.ts ~/.pi/agent/extensions/
  *           Restart pi; the startup header lists loaded extensions.
  *
  * What it does:
- *   Before the agent runs a bash command, this guard checks it for
+ *   Before the agent runs a bash command, this extension checks it for
  *     - any git command that can change a repository (init, add, commit, stash,
  *       checkout, restore, reset, clean, push, ...), and
  *     - recursive deletion (rm -r, rm -rf, rm --recursive).
@@ -13,14 +13,14 @@
  *
  * Default is BLOCK:
  *   - you decline or close the dialog        -> blocked
- *   - no interactive UI (print / JSON / RPC) -> blocked
- *   - the dialog cannot be shown (error)     -> blocked
- *   If you overlook the dialog, nothing happens: the agent simply waits.
+ *   - no dialog possible (print / JSON mode) -> blocked
+ *   - the dialog fails with an error         -> blocked
+ *   There is no timer: if you are away, the agent waits until you answer, and nothing runs meanwhile.
  *
  * Read-only git commands pass without asking:
  *   status, diff, log, show, ls-files, rev-parse, blame, grep, help, version
  *
- * Limits: the guard only sees commands of pi's bash tool. It is a pattern check,
+ * Limits: the extension only sees commands of pi's bash tool. It is a pattern check,
  * not a sandbox; it errs on the side of asking (e.g. `rg 'git init'` also asks).
  */
 
@@ -63,7 +63,7 @@ export default function (pi: any) {
     const blocked = {
       block: true,
       reason:
-        `Blocked by data-guard: ${reason}. Do not retry this in another form ` +
+        `Blocked by confirmation-dialog: ${reason}. Do not retry this in another form ` +
         `(no aliases, scripts, sh -c or full paths). Continue without it, or ask the user ` +
         `to run it themselves.`,
     };
@@ -72,7 +72,7 @@ export default function (pi: any) {
 
     try {
       const ok = await ctx.ui.confirm(
-        "data-guard",
+        "confirmation-dialog",
         `The agent wants to run:\n\n${command}\n\nReason for asking: ${reason}.\nAllow this once?`,
       );
       return ok === true ? undefined : blocked;

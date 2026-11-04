@@ -22,7 +22,7 @@ When the user provides a non-technical, human-level requirement (text or image/s
 - Every other git command is forbidden, above all `git init`, and also `add`, `commit`, `stash`, `checkout`, `switch`, `restore`, `reset`, `clean`, `rm`, `mv`, `rebase`, `merge`, `pull`, `push`, `branch`, `tag`, `config`. These commands can hide, overwrite, or delete the user's work, and a repository created in the wrong place (e.g. the home directory) silently covers everything below it.
 - Never create a repository on your own initiative, not even "to make verification easier", and never suggest one. A directory without git is a normal state, not a problem to fix.
 - Single exception: the user asks for one specific git command in their own message (e.g. "run git init in ~/projects/shop"). A "yes", "ok", "go" or "use defaults" in reply to another question is NOT such a request. Even then, never run `git init` in `$HOME`, `/` or a system directory.
-- If a command is blocked by a guard or declined by the user, do not retry it in another form (no `sh -c`, aliases, scripts, or full paths). Continue without it or ask the user.
+- If a command is blocked by the confirmation-dialog extension or declined by the user, do not retry it in another form (no `sh -c`, aliases, scripts, or full paths). Continue without it or ask the user.
 
 **Single source of truth:** Progress is determined by comparing the files with the plan's baseline snapshot, never by checkboxes alone. The checkboxes in `.pi/PLAN.md` are the human-readable mirror of that comparison, and you keep them in sync (Phase 1.3 and Phase 6).
 
@@ -35,7 +35,7 @@ When the user provides a non-technical, human-level requirement (text or image/s
 ## Phase 1: Domain Translation & Map Lookup
 0. **Project Root & Tool Check (once per session):**
    `pwd; echo "HOME=$HOME"; git rev-parse --show-toplevel 2>/dev/null || echo "no git repository"`
-   `for t in rg ctags jq ast-grep git; do command -v "$t" >/dev/null && echo "ok      $t" || echo "MISSING $t"; done`
+   `for t in rg ctags jq git; do command -v "$t" >/dev/null && echo "ok      $t" || echo "MISSING $t"; done`
    - **Project root** = the git top level if pi runs inside an existing repository, otherwise the current directory.
    - The project root must never be `$HOME`, `/`, or a system directory (`/etc`, `/usr`, `/var`, `/opt`, `/boot`, `/root`), even if `$HOME` itself is a git repository. If it would be: do not scan it and do not create `.pi/` there. If the user's request names a project directory, use that one; otherwise stop now and ask: "Which project directory is this about?" (no default).
    - If `rg --files --no-require-git | head -20001 | wc -l` prints `20001`, the directory is too large to be a single project: ask which subdirectory is meant.
@@ -212,16 +212,16 @@ Keep every output small, because the context window is limited: use `-M 200`, `-
 - `rg -n --hidden -g '!.git' 'pattern' .` – also search dotfiles such as `.github/` or `.env.example`
 - Files in `.pi/`: pass the path explicitly (`rg -n 'pattern' .pi/PLAN.md`) or use `ls` / `read`.
 
-### `ast-grep` – structural search on the syntax tree (optional)
-Use it when a regex would be fragile: calls with a specific argument shape, JSX elements, nested constructs. Fallback if missing: `rg`.
-- Always call it `ast-grep`, never `sg`: on Ubuntu, `sg` is a different system command (switch group).
-- Always put the pattern in single quotes, otherwise bash replaces `$URL` with an empty string and nothing matches.
-- `$NAME` matches exactly one syntax node, `$$$` matches any number of nodes (e.g. all arguments).
-- `-l` must match the file type: `ts` for `.ts`, `tsx` for `.tsx`, `js`, `py`, `rust`, `go`, …
-- `ast-grep -p 'fetch($URL)' -l ts src/` – all `fetch` calls with exactly one argument
-- `ast-grep -p 'useEffect($$$)' -l tsx src/` – all `useEffect` calls in `.tsx` files
-- `ast-grep -p 'await $DB.query($$$)' -l ts src/` – all awaited `query` calls on any object
-- If a pattern finds nothing although `rg` finds the code, the pattern is wrong: simplify it or use `rg`.
+### Code-shaped searches with `rg` (calls, arguments, multi-line constructs)
+`rg` matches text, not syntax. It also finds hits in comments and strings, and nested parentheses can break a pattern. That is fine for reconnaissance, because every relevant hit is checked with `read` anyway.
+- `rg -n '\bfetch\(\s*[^,()]+\)' -t ts src/` – `fetch` calls with exactly one simple argument (no comma, no nested parentheses)
+- `rg -n '\buseEffect\(' -t ts src/` – all `useEffect` calls (`\b` avoids matches inside longer names)
+- `rg -n 'await\s+\w+\.query\(' -t ts src/` – awaited `query` calls on any object
+- `rg -n -U '\.query\([^;]*?WHERE' -t ts src/` – `-U` (multiline): a call whose arguments span several lines, here a `query` call containing `WHERE`
+- `rg -n -U '<Button\b[^>]*variant=' -t ts src/` – a JSX element with a certain prop, even if its props span several lines
+- `rg -n '^\s*@Controller\(' -t ts src/` – decorators and other line-start constructs (`^\s*` = start of line, after indentation)
+- `rg -n '\bfetch\(' -t ts src/ | rg -v '^[^:]+:[0-9]+:\s*(//|/?\*)'` – drop hits in comment lines
+- If a code-shaped pattern finds nothing, simplify it step by step (`rg -n '\bfetch\('` first), instead of guessing a more complex one.
 
 ### `ctags` (Universal Ctags) – symbol outline with line numbers
 Output columns: name, kind, start line, file, source line.
