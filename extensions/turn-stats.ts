@@ -35,6 +35,18 @@
  * session_shutdown — the ticker interval is always stopped, so it can never
  * keep the process alive.
  *
+ * v3 — thinking statement: right after each thinking block ends (pi-ai
+ * stream events thinking_start/thinking_end on message_update) a dim chat
+ * entry (custom type "turn-thinking", LLM-invisible) reports how long the
+ * model thought and how many tokens the thinking cost, e.g.
+ *   🧠 thought 12.4s · ≈1,234 thinking tok
+ * Providers only fill usage.reasoning from the FINAL usage chunk, so at
+ * thinking_end the exact count is normally unknown: the statement uses
+ * usage.reasoning when the provider already reported it, otherwise an
+ * estimate (house chars/4 heuristic) of the block's full text, marked with
+ * "≈". A thinking block cut off by an abort gets a "truncated" statement
+ * with the duration only.
+ *
  * Auto-loaded from ~/.pi/agent/extensions/. Pure core (startTurn/addUsage/
  * finishTurn/liveStats/formatters) is exported and unit-tested in
  * ~/.pi/agent/projects/turn-stats/test/turn-stats.test.ts.
@@ -76,6 +88,7 @@ export interface TurnStatsData {
 }
 
 const CUSTOM_TYPE = "turn-stats";
+const THINKING_TYPE = "turn-thinking";
 const WIDGET_KEY = "turn-stats";
 
 // ── Pure core (unit-tested) ──────────────────────────────────────────────────
@@ -177,6 +190,45 @@ export function formatLiveLine(s: LiveTurnStats): string {
   return `⏱ ${formatDuration(s.elapsedMs)} · ↑ ${formatNumber(s.input)} in · ↓ ${formatNumber(s.output)} out · ${s.tokensPerSec.toFixed(1)} tok/s`;
 }
 
+/** Stats for one finished thinking block (stored as custom-entry data). */
+export interface ThinkingStatsData {
+  startedAt: number;
+  finishedAt: number;
+  durationMs: number;
+  /** Thinking tokens: exact (provider-reported) or estimated, null if unknown. */
+  tokens: number | null;
+  /** True when tokens came from the chars/4 estimate of the thinking text. */
+  estimated: boolean;
+  /** True when the block was cut off (abort) before its thinking_end. */
+  truncated: boolean;
+}
+
+/** House token heuristic (pi core's estimateTokens: ceil(chars / 4)). */
+export function estimateThinkingTokens(text: string): number {
+  return Math.ceil(text.length / 4);
+}
+
+export function thinkingStats(
+  startedAt: number,
+  endedAt: number,
+  exactTokens: number | null | undefined,
+  thinkingText: string | null,
+  truncated = false,
+): Omit<ThinkingStatsData, "startedAt" | "finishedAt"> {
+  const durationMs = Math.max(0, endedAt - startedAt);
+  if (exactTokens != null) return { durationMs, tokens: exactTokens, estimated: false, truncated };
+  if (thinkingText) return { durationMs, tokens: estimateThinkingTokens(thinkingText), estimated: true, truncated };
+  return { durationMs, tokens: null, estimated: false, truncated };
+}
+
+/** The one-line chat rendering of a finished thinking block. */
+export function formatThinkingLine(s: Pick<ThinkingStatsData, "durationMs" | "tokens" | "estimated" | "truncated">): string {
+  const parts = [`🧠 thought ${formatDuration(s.durationMs)}`];
+  if (s.tokens != null) parts.push(`${s.estimated ? "≈" : ""}${formatNumber(s.tokens)} thinking tok`);
+  if (s.truncated) parts.push("truncated");
+  return parts.join(" · ");
+}
+
 // ── Extension ────────────────────────────────────────────────────────────────
 
 export interface TurnStatsOptions {
@@ -193,6 +245,8 @@ export default function (pi: ExtensionAPI, options: TurnStatsOptions = {}): void
   let turn: TurnTracker | null = null;
   /** Usage of the in-flight assistant message, when the provider streams it. */
   let liveUsage: TurnUsageLike | null = null;
+  /** Start time of the in-flight thinking block, or null (v3). */
+  let thinkingStartedAt: number | null = null;
   let ticker: ReturnType<typeof setInterval> | null = null;
   let lastCtx: ExtensionContext | null = null;
   let lastLine: string | null = null;
@@ -204,6 +258,12 @@ export default function (pi: ExtensionAPI, options: TurnStatsOptions = {}): void
       lastLine = line;
       ctx.ui.setWidget(WIDGET_KEY, [line]);
     }
+  };
+
+  /** Append the thinking statement for one finished block (v3). */
+  const emitThinking = (ctx: ExtensionContext, stats: Omit<ThinkingStatsData, "startedAt" | "finishedAt">, startedAt: number, finishedAt: number): void => {
+    if (!ctx.hasUI) return; // print/json mode: no chat transcript to render into
+    pi.appendEntry(THINKING_TYPE, { startedAt, finishedAt, ...stats });
   };
 
   const startTicker = (ctx: ExtensionContext): void => {
@@ -230,6 +290,7 @@ export default function (pi: ExtensionAPI, options: TurnStatsOptions = {}): void
     if (!turn) {
       turn = startTurn(Date.now());
       liveUsage = null;
+      thinkingStartedAt = null;
       startTicker(ctx);
     }
   });
@@ -240,7 +301,10 @@ export default function (pi: ExtensionAPI, options: TurnStatsOptions = {}): void
     if (!turn) return;
     // New assistant message: drop the previous in-flight usage; keep whatever
     // the provider already reported on the partial (e.g. Anthropic input tokens).
-    if (m && m.role === "assistant") liveUsage = m.usage ?? null;
+    if (m && m.role === "assistant") {
+      liveUsage = m.usage ?? null;
+      thinkingStartedAt = null; // a new model call never inherits a thinking span
+    }
   });
 
   pi.on("message_update", (event, ctx) => {
@@ -249,6 +313,21 @@ export default function (pi: ExtensionAPI, options: TurnStatsOptions = {}): void
     if (!turn) return;
     // High-frequency: only capture, never render (the ticker does that).
     if (m && m.role === "assistant" && m.usage) liveUsage = m.usage;
+    // Thinking-block tracking (v3): only start/end matter, never per-delta.
+    if (m && m.role === "assistant") {
+      const se = event.assistantMessageEvent;
+      if (se && se.type === "thinking_start") {
+        thinkingStartedAt = Date.now();
+      } else if (se && se.type === "thinking_end" && thinkingStartedAt != null) {
+        const startedAt = thinkingStartedAt;
+        const finishedAt = Date.now();
+        thinkingStartedAt = null;
+        // usage.reasoning is normally only set from the provider's FINAL usage
+        // chunk, so prefer it when present and otherwise estimate from the
+        // block's full text (carried by the thinking_end event).
+        emitThinking(ctx, thinkingStats(startedAt, finishedAt, m.usage?.reasoning ?? null, se.content), startedAt, finishedAt);
+      }
+    }
   });
 
   pi.on("message_end", (event, ctx) => {
@@ -258,6 +337,13 @@ export default function (pi: ExtensionAPI, options: TurnStatsOptions = {}): void
     if (m && m.role === "assistant") {
       addUsage(turn, m.usage);
       liveUsage = null; // final usage is now in the tracker
+      // Thinking block cut off before its thinking_end (e.g. abort).
+      if (thinkingStartedAt != null) {
+        const startedAt = thinkingStartedAt;
+        const finishedAt = Date.now();
+        thinkingStartedAt = null;
+        emitThinking(ctx, thinkingStats(startedAt, finishedAt, m.usage?.reasoning ?? null, null, true), startedAt, finishedAt);
+      }
     }
   });
 
@@ -274,11 +360,24 @@ export default function (pi: ExtensionAPI, options: TurnStatsOptions = {}): void
   });
 
   // A session switch/quit/reload mid-run must not leak the accumulator, the
-  // in-flight usage or the ticker interval (or pi would not exit).
+  // in-flight usage, the thinking span or the ticker interval (or pi would
+  // not exit).
   pi.on("session_shutdown", (_event, ctx) => {
     stopTicker(ctx);
     turn = null;
     liveUsage = null;
+    thinkingStartedAt = null;
+  });
+
+  pi.registerEntryRenderer<ThinkingStatsData>(THINKING_TYPE, (entry, _opts, theme) => {
+    const data = entry.data;
+    const box = new Box(1, 1, (text) => theme.bg("customMessageBg", text));
+    if (!data) {
+      box.addChild(new Text(theme.fg("dim", "[turn-thinking: missing data]"), 0, 0));
+      return box;
+    }
+    box.addChild(new Text(theme.fg("dim", formatThinkingLine(data)), 0, 0));
+    return box;
   });
 
   pi.registerEntryRenderer<TurnStatsData>(CUSTOM_TYPE, (entry, { expanded }, theme) => {

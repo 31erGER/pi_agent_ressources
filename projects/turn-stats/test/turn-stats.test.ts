@@ -17,6 +17,9 @@ import { Box } from "@earendil-works/pi-tui";
 import turnStatsExt, {
   type TurnStatsData,
   addUsage,
+  estimateThinkingTokens,
+  formatThinkingLine,
+  thinkingStats,
   finishTurn,
   formatClock,
   formatCost,
@@ -194,6 +197,48 @@ const T1 = Date.parse("2025-11-03T14:32:05.000Z"); // T0 + 42.3s later? -> 65s; 
     formatLiveLine({ elapsedMs: 900, input: 10, output: 2, tokensPerSec: 0 }) === "⏱ <1s · ↑ 10 in · ↓ 2 out · 0.0 tok/s",
     formatLiveLine({ elapsedMs: 900, input: 10, output: 2, tokensPerSec: 0 }),
   );
+}
+
+// estimateThinkingTokens (v3)
+{
+  check("estimateThinkingTokens: house chars/4 heuristic",
+    estimateThinkingTokens("") === 0 &&
+    estimateThinkingTokens("abc") === 1 &&
+    estimateThinkingTokens("x".repeat(400)) === 100 &&
+    estimateThinkingTokens("x".repeat(1001)) === 251);
+}
+
+// thinkingStats (v3)
+{
+  const s = thinkingStats(T0, T0 + 12_400, 999, "ignored text");
+  check("thinkingStats: exact tokens win over estimate",
+    s.durationMs === 12_400 && s.tokens === 999 && s.estimated === false && s.truncated === false,
+    JSON.stringify(s));
+  const e = thinkingStats(T0, T0 + 12_400, null, "x".repeat(400));
+  check("thinkingStats: falls back to estimate (flagged)",
+    e.tokens === 100 && e.estimated === true,
+    JSON.stringify(e));
+  const n = thinkingStats(T0, T0 + 8_200, null, null, true);
+  check("thinkingStats: no data -> tokens null, truncated kept",
+    n.tokens === null && n.estimated === false && n.truncated === true && n.durationMs === 8_200,
+    JSON.stringify(n));
+  check("thinkingStats: negative duration clamped", thinkingStats(T0, T0 - 5, 3, null).durationMs === 0);
+}
+
+// formatThinkingLine (v3)
+{
+  check("formatThinkingLine: exact tokens",
+    formatThinkingLine({ durationMs: 12_400, tokens: 1234, estimated: false, truncated: false }) ===
+      "🧠 thought 12.4s · 1,234 thinking tok");
+  check("formatThinkingLine: estimated tokens marked ≈",
+    formatThinkingLine({ durationMs: 12_400, tokens: 1234, estimated: true, truncated: false }) ===
+      "🧠 thought 12.4s · ≈1,234 thinking tok");
+  check("formatThinkingLine: truncated without tokens",
+    formatThinkingLine({ durationMs: 8_200, tokens: null, estimated: false, truncated: true }) ===
+      "🧠 thought 8.2s · truncated");
+  check("formatThinkingLine: sub-second",
+    formatThinkingLine({ durationMs: 900, tokens: 12, estimated: false, truncated: false }) ===
+      "🧠 thought <1s · 12 thinking tok");
 }
 
 // ── Part 2: integration with a mock ExtensionAPI ─────────────────────────────
@@ -408,7 +453,7 @@ const theme = {
   check("widget: live line reflects completed usage",
     lineAfterMsgText.includes("↑ 4,000 in") && lineAfterMsgText.includes("↓ 80 out"), lineAfterMsgText);
 
-  await fire(pi, "message_update", { message: { role: "assistant", usage: { input: 100, output: 30 } } });
+  await fire(pi, "message_update", { message: { role: "assistant", usage: { input: 100, output: 30 } }, assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "x", partial: {} } });
   await sleep(30);
   const lineLive = [...pi.widgetCalls].reverse().find((c) => c.value !== undefined);
   const lineLiveText = Array.isArray(lineLive?.value) ? String((lineLive.value as string[])[0]) : String(lineLive?.value);
@@ -447,6 +492,80 @@ const theme = {
   await fire(pi, "agent_settled", { aborted: false });
   await sleep(20);
   check("hasUI=false: widget never touched", pi.widgetCalls.length === 0, JSON.stringify(pi.widgetCalls));
+}
+
+// thinking statement (v3)
+{
+  const pi = makeMockPi(true);
+  turnStatsExt(pi as never, { tickMs: 5 });
+  const thinkStart = { message: { role: "assistant" }, assistantMessageEvent: { type: "thinking_start", contentIndex: 0, partial: {} } };
+  const thinkEnd = (text: string, usage?: unknown) => ({
+    message: { role: "assistant" as const, ...(usage === undefined ? {} : { usage }) },
+    assistantMessageEvent: { type: "thinking_end", contentIndex: 0, content: text, partial: {} },
+  });
+
+  // normal block: duration + estimated tokens (no usage.reasoning reported yet)
+  await fire(pi, "agent_start", {});
+  await fire(pi, "message_start", { message: { role: "assistant" } });
+  await fire(pi, "message_update", thinkStart);
+  await sleep(30);
+  check("thinking: nothing appended while thinking runs", pi.entries.length === 0);
+  await fire(pi, "message_update", thinkEnd("x".repeat(400)));
+  const th = pi.entries[0];
+  check("thinking: one statement right after thinking ends", pi.entries.length === 1 && th?.customType === "turn-thinking",
+    JSON.stringify(pi.entries));
+  const thData = th?.data as { durationMs: number; tokens: number | null; estimated: boolean; truncated: boolean } | undefined;
+  check("thinking: statement has duration >= 30ms and estimated tokens 100",
+    !!thData && thData.durationMs >= 30 && thData.tokens === 100 && thData.estimated === true && thData.truncated === false,
+    JSON.stringify(thData));
+
+  // exact tokens: provider already reported usage.reasoning on the partial
+  await fire(pi, "message_update", thinkStart);
+  await fire(pi, "message_update", thinkEnd("y".repeat(800), { input: 10, output: 5, reasoning: 777 }));
+  const th2 = pi.entries[1]?.data as { tokens: number | null; estimated: boolean } | undefined;
+  check("thinking: exact usage.reasoning preferred over estimate",
+    pi.entries.length === 2 && th2?.tokens === 777 && th2.estimated === false,
+    JSON.stringify(th2));
+
+  // truncated block: thinking_start, then message_end without thinking_end
+  await fire(pi, "message_start", { message: { role: "assistant" } });
+  await fire(pi, "message_update", thinkStart);
+  await fire(pi, "message_end", { message: { role: "assistant" } });
+  const th3 = pi.entries[2]?.data as { truncated: boolean; tokens: number | null } | undefined;
+  check("thinking: truncated block -> statement with truncated flag, no tokens",
+    pi.entries.length === 3 && th3?.truncated === true && th3.tokens === null,
+    JSON.stringify(th3));
+
+  // span reset: thinking_start, then a NEW message starts -> late thinking_end is ignored
+  await fire(pi, "message_start", { message: { role: "assistant" } });
+  await fire(pi, "message_update", thinkStart);
+  await fire(pi, "message_start", { message: { role: "assistant" } });
+  await fire(pi, "message_update", thinkEnd("z".repeat(400)));
+  check("thinking: span reset across message_start (no leak)", pi.entries.length === 3, String(pi.entries.length));
+
+  // stray thinking_end without a start: ignored
+  await fire(pi, "message_update", thinkEnd("q".repeat(400)));
+  check("thinking: stray thinking_end ignored", pi.entries.length === 3, String(pi.entries.length));
+
+  // non-assistant message_update: ignored
+  await fire(pi, "message_update", { message: { role: "toolResult" }, assistantMessageEvent: { type: "thinking_start", contentIndex: 0, partial: {} } });
+  check("thinking: non-assistant message_update ignored", pi.entries.length === 3, String(pi.entries.length));
+
+  await fire(pi, "agent_settled", { aborted: false });
+  check("thinking: turn still settled cleanly (widget cleared, no turn entry without usage)",
+    pi.widgetCalls.some((c) => c.value === undefined) && pi.entries.every((e) => e.customType === "turn-thinking"),
+    JSON.stringify(pi.entries.map((e) => e.customType)));
+}
+
+{ // hasUI=false: no thinking statements
+  const pi = makeMockPi(false);
+  turnStatsExt(pi as never, { tickMs: 5 });
+  await fire(pi, "agent_start", {});
+  await fire(pi, "message_start", { message: { role: "assistant" } });
+  await fire(pi, "message_update", { message: { role: "assistant" }, assistantMessageEvent: { type: "thinking_start", contentIndex: 0, partial: {} } });
+  await fire(pi, "message_update", { message: { role: "assistant" }, assistantMessageEvent: { type: "thinking_end", contentIndex: 0, content: "x".repeat(400), partial: {} } });
+  await fire(pi, "agent_settled", { aborted: false });
+  check("thinking: hasUI=false -> no entries", pi.entries.length === 0, JSON.stringify(pi.entries));
 }
 
 // ── summary ──────────────────────────────────────────────────────────────────

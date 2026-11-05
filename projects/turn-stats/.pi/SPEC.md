@@ -128,3 +128,67 @@
   otherwise a ref'd interval keeps the pi process alive.
 - Widget key is `"turn-stats"` (same namespace as the custom entry type);
   `setWidget(key, undefined)` clears it.
+
+## 8. v3 — Thinking statement right after the thinking block ends
+
+### 8.1 Human Requirement (Original Intent)
+> The end-of-turn stats already include thinking (wanted that way, no change
+> there). Additionally: a stats statement right after the model's thinking is
+> done, showing how long the model thought and how many tokens the thinking
+> cost.
+
+### 8.2 Architecture & Data Flow
+- **Core Mechanism:** pi's stream events include `thinking_start` /
+  `thinking_end` (on `message_update.assistantMessageEvent`). On
+  `thinking_start` we record the time; on `thinking_end` we compute the exact
+  duration and append a dim chat entry (custom entry `"turn-thinking"`,
+  LLM-invisible, same mechanism as the v1 turn line). Thinking tokens:
+  `usage.reasoning` is only populated from the provider's FINAL usage chunk
+  (verified in pi-ai: Anthropic `message_delta` at message end,
+  OpenAI-compatible final chunk) → at `thinking_end` it is normally unknown,
+  so the statement uses the exact `usage.reasoning` when the provider already
+  reported it, otherwise an estimate via the house chars/4 heuristic on the
+  full thinking text (carried by `thinking_end.content`), clearly marked with
+  "≈". A thinking block cut off by an abort (no `thinking_end` before
+  `message_end`) yields a `"truncated"` statement with duration only.
+- **Data / Control Flow:**
+  `message_update(assistantMessageEvent.type=="thinking_start") -> thinkingStartedAt = now`
+  `message_update(...=="thinking_end") -> thinkingStats(startedAt, now, usage?.reasoning, content) -> pi.appendEntry("turn-thinking", data)`
+  `message_end(assistant, span still open) -> truncated statement`
+  `message_start(assistant) -> span reset (new model call)`
+- **Acceptance Criteria:**
+  1. One dim statement per thinking block, appended right after the block
+     ends: `🧠 thought 12.4s · ≈1,234 thinking tok` (≈ when estimated, plain
+     number when the provider reported it).
+  2. Duration is measured thinking_start → thinking_end (exact wall clock);
+     tokens are exact `usage.reasoning` when available at that moment, else
+     chars/4 estimate of the thinking text, else omitted (truncated block).
+  3. Multiple thinking blocks in one message (interleaved thinking) produce
+     one statement each; thinking state never leaks across messages/turns;
+     nothing is appended in print/json mode (hasUI=false).
+  4. `thinkingStats`/`formatThinkingLine`/`estimateThinkingTokens` are pure,
+     exported and unit-tested; v1/v2 behavior is unchanged (turn-end line and
+     live widget keep working, 52 existing tests stay green).
+
+### 8.3 Checklist (v3)
+- [x] **S1:** SPEC updated (this section) — verify: file read
+- [x] **S2 (CURRENT):** RED — thinking-core + integration tests in
+      `test/turn-stats.test.ts` — verify: `node test/turn-stats.test.ts` fails
+      (missing exports / no entries appended on thinking events)
+- [x] **S3:** GREEN — extend `turn-stats.ts` (span tracking, thinking_end /
+      truncated message_end handling, `turn-thinking` entry renderer)
+      — verify: `node test/turn-stats.test.ts` passes
+- [x] **S4:** typecheck + loader-check — verify: `npm run typecheck`,
+      `npm run loader-check` clean
+
+### 8.4 Negative Knowledge (v3)
+- **`usage.reasoning` is NOT available at `thinking_end`** for the major
+  providers (populated only from the final usage chunk — verified in pi-ai
+  dist: anthropic-messages.js:663, openai-completions.js:1179,
+  openai-responses-shared.js:502). Never block on it; estimate with "≈".
+- **`thinking_delta` is high-frequency** — only `thinking_start` /
+  `thinking_end` are handled; no per-delta work.
+- `thinking_end.assistantMessageEvent.content` carries the COMPLETE thinking
+  text of the block (pi-ai types) — that is the estimation input.
+- One statement per thinking block means noisy turns get several lines —
+  that is the requested behavior; do not silently dedupe.
