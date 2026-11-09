@@ -1,0 +1,62 @@
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+
+export default function webToolsExtension(pi: ExtensionAPI) {
+    // 1. TOOL: SEARCH (SearXNG abfragen)
+    pi.registerTool({
+        name: "search",
+        description: "Durchsucht das Web über die lokale SearXNG-Instanz nach aktuellen Informationen und Dokumentationen.",
+        parameters: {
+            type: "object",
+            properties: {
+                query: { type: "string", description: "Suchbegriff" },
+            },
+            required: ["query"],
+        },
+        execute: async ({ query }: { query: string }) => {
+            try {
+                const url = `http://localhost:8080/search?q=${encodeURIComponent(query)}&format=json`;
+                const res = await fetch(url);
+                const data = await res.json();
+
+                // Nur die Top 5 Treffer nehmen, um Kontext zu sparen
+                const topResults = (data.results || []).slice(0, 5).map((r: any) => ({
+                    title: r.title,
+                    url: r.url,
+                    snippet: r.content,
+                }));
+
+                return JSON.stringify(topResults, null, 2);
+            } catch (err: any) {
+                return `Suchfehler: ${err.message}. Läuft der SearXNG Docker-Container auf Port 8080?`;
+            }
+        },
+    });
+
+    // 2. TOOL: FETCH (Webseite laden & HTML-Tags strippen)
+    pi.registerTool({
+        name: "fetch",
+        description: "Lädt den Textinhalt einer spezifischen URL herunter.",
+        parameters: {
+            type: "object",
+            properties: {
+                url: { type: "string", description: "Vollständige HTTP/HTTPS URL" },
+            },
+            required: ["url"],
+        },
+        execute: async ({ url }: { url: string }) => {
+            try {
+                // Jina Reader als transparenter Markdown-Proxy oder direkter GET
+                // https://r.jina.ai/ konvertiert jede URL serverlos in perfektes Markdown!
+                const res = await fetch(`https://r.jina.ai/${url}`, {
+                    headers: { "X-No-Cache": "true" }
+                });
+                const markdown = await res.text();
+
+                // Truncate bei 4.000 Zeichen, um 27B-Modell-Kontext zu schützen
+                return markdown.slice(0, 4000);
+            } catch (err: any) {
+                return `Fetch-Fehler: ${err.message}`;
+            }
+        },
+    });
+}

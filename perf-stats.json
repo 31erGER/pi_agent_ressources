@@ -2,32 +2,46 @@
   "version": 1,
   "tools": {
     "read": {
-      "calls": 96,
-      "totalMs": 147,
+      "calls": 116,
+      "totalMs": 201,
       "maxMs": 6,
       "firstSeen": "2026-11-03T12:47:05.669Z",
-      "lastUsed": "2026-11-04T17:28:29.617Z"
+      "lastUsed": "2026-11-09T17:25:48.344Z"
     },
     "bash": {
-      "calls": 767,
-      "totalMs": 3743024,
+      "calls": 879,
+      "totalMs": 3955559,
       "maxMs": 600007,
       "firstSeen": "2026-11-03T12:47:36.628Z",
-      "lastUsed": "2026-11-05T17:29:57.311Z"
+      "lastUsed": "2026-11-09T17:55:56.474Z"
     },
     "write": {
-      "calls": 56,
-      "totalMs": 60,
-      "maxMs": 3,
+      "calls": 63,
+      "totalMs": 71,
+      "maxMs": 4,
       "firstSeen": "2026-11-03T12:56:37.582Z",
-      "lastUsed": "2026-11-04T15:45:09.681Z"
+      "lastUsed": "2026-11-09T16:15:23.018Z"
     },
     "edit": {
-      "calls": 144,
-      "totalMs": 312,
+      "calls": 188,
+      "totalMs": 426,
       "maxMs": 16,
       "firstSeen": "2026-11-03T12:58:35.457Z",
-      "lastUsed": "2026-11-05T17:29:39.031Z"
+      "lastUsed": "2026-11-09T17:45:38.317Z"
+    },
+    "search": {
+      "calls": 13,
+      "totalMs": 10361,
+      "maxMs": 3011,
+      "firstSeen": "2026-11-09T08:50:17.633Z",
+      "lastUsed": "2026-11-09T17:17:28.287Z"
+    },
+    "fetch": {
+      "calls": 15,
+      "totalMs": 4011,
+      "maxMs": 1796,
+      "firstSeen": "2026-11-09T15:54:24.175Z",
+      "lastUsed": "2026-11-09T17:18:34.286Z"
     }
   }
 }

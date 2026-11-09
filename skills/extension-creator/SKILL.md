@@ -6,7 +6,7 @@ description: Gives guidlines for usual steps when be asked to generate a new ext
 **Typical pathes:**
 
 - Use `~./pi/agent/extensions` to put the final `.ts` file inside. 
-- Use `~./pi/agent/projects/<your_extension_project_directory>` to put the name of the extension inside the <breakets>.
+- Use `~./pi/agent/projects/<your_extension_project_directory>` to put the name of the extension inside the <breakets>. This is also the project root folder for the project instance of the extension.
 
 
 **Steps:**

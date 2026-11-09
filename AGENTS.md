@@ -1,6 +1,11 @@
 # Global instructions
 As soon as your task is to programm something allways prioritize Test Driven Development (TDD) than do so.
 Prefer simple, robust and performant solutions and check if something can get broken before making changes. Make sure to test against breaking changes.
+Allways start your answer with a short abstract of what you want to say. After that you can write down your full response.
+The last part every answer has to include is instructions for the user and what he has to do next. If there is nothing to do also tell the user.
+Allways stick to english as our primary communication language.
+Whenever you think you read something interesting about the user you can persist this knowledge into `~/.pi/agent/USER.md` so you can evolve into an even better assistant.
+
 <!-- pi-env:start (managed by setup-pi-tools.sh) -->
 ## Safety rules (all projects)
 - Git: use only read-only git commands (status, diff, log, show, ls-files, rev-parse, blame). Never run `git init` or any other git command that changes or creates a repository, unless I ask for that exact command in my own message. A "yes" to another question is not such a request.
