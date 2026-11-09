@@ -1,0 +1,9 @@
+{
+  "name": "confirmation-dialog-project",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test test/",
+    "test:e2e": "node e2e-bell.mjs"
+  }
+}

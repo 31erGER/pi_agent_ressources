@@ -2,6 +2,10 @@
  * Notification chime — plays the turn-done sound the moment Pi settles
  * (run fully finished, waiting for user input again).
  *
+ * Also exports chime(), which confirmation-dialog.ts rings the moment its
+ * dialog pops up: you hear a bell every time the session needs you —
+ * turn settle AND confirmation prompt. One chime at a time (shared state).
+ *
  * Playback runs as a detached, unref'd daemon (ffplay): the handler returns
  * immediately, no stdio is piped, and the sound survives Pi exiting.
  */
@@ -18,10 +22,12 @@ const PLAYER = "ffplay";
 
 let current: ChildProcess | null = null;
 
-/** Fire-and-forget daemon spawn. Never blocks, never overlaps. */
-function play(): void {
+/** Fire-and-forget daemon spawn. Never blocks, never overlaps.
+ *  Shared bell: called by agent_settled (below) and by confirmation-dialog.ts. */
+export function chime(): void {
   if (VOLUME <= 0 || !existsSync(WAV_PATH)) return;
-  current?.kill("SIGKILL"); // a new turn ended before the last chime finished
+  trackExtensionRun(import.meta.url); // /stats global usage counter (one run per chime)
+  current?.kill("SIGKILL"); // a new chime was due before the last one finished
   const child = spawn(
     PLAYER,
     [
@@ -35,6 +41,10 @@ function play(): void {
   child.on("exit", () => {
     if (current === child) current = null;
   });
+  child.on("error", () => {
+    // e.g. ffplay missing: reset state, never let an unhandled 'error' crash pi
+    if (current === child) current = null;
+  });
   child.unref(); // daemonize: Pi neither waits for it nor is blocked by it
 }
 
@@ -43,7 +53,6 @@ export default function (pi: ExtensionAPI): void {
   // recovery, compaction, queued work) are exhausted — the true idle moment.
   pi.on("agent_settled", (event) => {
     if (event.aborted) return; // no chime for your own Escape
-    trackExtensionRun(import.meta.url); // /stats global usage counter (one run per chime)
-    play();
+    chime();
   });
 }

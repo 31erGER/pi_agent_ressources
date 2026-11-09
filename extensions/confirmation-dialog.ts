@@ -11,6 +11,13 @@
  *     - recursive deletion (rm -r, rm -rf, rm --recursive).
  *   Such a command only runs if you confirm it in a dialog.
  *
+ *   The dialog rings the notification bell the moment it pops up, so you
+ *   know when the session is waiting for you — in addition to the bell at
+ *   turn end. The bell is the shared chime() from notify-on-settle.ts
+ *   (dependency: keep that file, or the gate will not load).
+ *   In print/JSON mode no dialog (and no bell) is possible; the command is
+ *   blocked instead.
+ *
  * Default is BLOCK:
  *   - you decline or close the dialog        -> blocked
  *   - no dialog possible (print / JSON mode) -> blocked
@@ -23,6 +30,15 @@
  * Limits: the extension only sees commands of pi's bash tool. It is a pattern check,
  * not a sandbox; it errs on the side of asking (e.g. `rg 'git init'` also asks).
  */
+
+import { chime as bell } from "./notify-on-settle.ts";
+
+// Test seam: replace the bell in unit tests (keeps the suite silent).
+// Pass null to restore the real chime from notify-on-settle.ts.
+let ringBell: () => void = bell;
+export function setChime(fn: (() => void) | null): void {
+  ringBell = fn ?? bell;
+}
 
 const READ_ONLY_GIT = new Set([
   "status", "diff", "log", "show", "ls-files", "rev-parse", "blame", "grep", "help", "version",
@@ -69,6 +85,12 @@ export default function (pi: any) {
     };
 
     if (ctx?.hasUI === false || typeof ctx?.ui?.confirm !== "function") return blocked;
+
+    try {
+      ringBell(); // bell at the moment the dialog pops up (notify-on-settle.ts)
+    } catch {
+      // a broken bell must never keep the dialog (or the gate) from working
+    }
 
     try {
       const ok = await ctx.ui.confirm(
