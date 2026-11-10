@@ -38,12 +38,18 @@ const SEARCH_PAGE_MAX = 10; // hard cap for the page parameter (SearXNG pageno)
 
 type ResultDetails = Record<string, unknown>;
 
+interface SearchResultItem {
+    title: string;
+    url: string;
+    snippet: string;
+}
+
 function textResult(text: string, details: ResultDetails) {
-    return { content: [{ type: "text", text }], details };
+    return { content: [{ type: "text" as const, text }], details };
 }
 
 function errorResult(text: string, details: ResultDetails = {}) {
-    return { content: [{ type: "text", text }], details, isError: true };
+    return { content: [{ type: "text" as const, text }], details, isError: true };
 }
 
 const NAMED_ENTITIES: Record<string, string> = {
@@ -195,7 +201,7 @@ const searchTool = defineTool({
                 return errorResult("search: unexpected SearXNG response (missing 'results' array)", { query });
             }
 
-            const top = data.results.slice(0, limit).map((r: any) => ({
+            const top: SearchResultItem[] = data.results.slice(0, limit).map((r: any) => ({
                 title: (typeof r?.title === "string" && r.title.trim()) || "(untitled)",
                 url: typeof r?.url === "string" ? r.url : "(no url)",
                 snippet: typeof r?.content === "string"

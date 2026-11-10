@@ -2,8 +2,9 @@
  * Live-preview theme picker for pi.
  *
  * Plain-object component — no pi-tui import — so it runs and is tested under
- * plain Node. pi's `ui.custom()` only requires an object with
- * render/handleInput (optionally invalidate).
+ * plain Node. pi's `ui.custom()` runtime accepts render/handleInput alone,
+ * but pi's `Component` type requires `invalidate`, so PickerComponent
+ * declares it required and the picker always provides it.
  *
  * Preview semantics (verified in interactive-mode.js):
  *  - setTheme(ThemeInstance)  -> applied, NOT persisted  (used while browsing)
@@ -17,7 +18,8 @@ export interface PickerKeybindings {
 export interface PickerComponent {
   render(width: number): string[];
   handleInput(data: string): void;
-  invalidate?(): void;
+  /** Required by pi's `Component` type (and always provided below). */
+  invalidate(): void;
 }
 
 export interface PickerTheme {
@@ -41,7 +43,8 @@ export interface PickerUI {
   getTheme(name: string): unknown | undefined;
   setTheme(theme: string | object): { success: boolean; error?: string };
   notify(message: string, type?: "info" | "warning" | "error"): void;
-  custom<T>(factory: PickerFactory): Promise<T>;
+  /** Resolves with the value passed to `done()` (string) or undefined on cancel. */
+  custom(factory: PickerFactory): Promise<string | undefined>;
 }
 
 const PAGE = 5;

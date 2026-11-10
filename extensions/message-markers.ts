@@ -257,10 +257,25 @@ interface RailTheme {
 
 const fallbackTheme: RailTheme = { fg: (_c, text) => text ?? "" };
 
+/**
+ * pi-tui's `ScrollView.child` is `private readonly` in the published types
+ * (an intersection with a public `child` collapses to `never`), but the rail
+ * needs to read and re-wrap the live document it holds — at runtime it is a
+ * plain field (scroll-view.js: `this.child = component`). This structural
+ * view exposes exactly the members the rail uses.
+ */
+type TranscriptView = {
+	child: Component;
+	invalidate(): void;
+	readonly scrollTop: number;
+	readonly viewportHeight: number;
+	scrollTo(scrollTop: number, options?: { disableFollow?: boolean }): void;
+};
+
 export interface RailState {
 	enabled: boolean;
 	activeTui: TUI | null;
-	transcript: ScrollView | null;
+	transcript: TranscriptView | null;
 	getTheme: () => RailTheme;
 	lastWidth: number;
 	/** Rendered document height from the last frame (for click geometry). */
@@ -527,10 +542,10 @@ function snapshotKey(doc: unknown, width: number): string {
 	return parts.join("/");
 }
 
-function findTranscript(root: Component): ScrollView | null {
+function findTranscript(root: Component): TranscriptView | null {
 	const kids = childrenOf(root);
 	if (!kids) return null;
-	for (const k of kids) if (k instanceof ScrollView) return k;
+	for (const k of kids) if (k instanceof ScrollView) return k as unknown as TranscriptView;
 	return null;
 }
 
