@@ -18,7 +18,7 @@
 - When a task should be planned before it is executed (new feature, workflow change, larger bug), use the `plan` skill.
 - Prefer simple, robust and performant solutions and check if something can get broken before making changes. Make sure to test against breaking changes.
 - If the project has `.pi/LOG.md`: after a compaction or at the start of a session, read `.pi/PLAN.md` and `tail -n 60 .pi/LOG.md` before doing anything else.
-- Whenever you think you read something interesting about the user you can persist this knowledge into `~/.pi/agent/USER.md` so you can evolve into an even better assistant.
+- Whenever you think you read something interesting about the user you can persist this knowledge into `~/.pi/agent/USER.md` so you can evolve into a better assistant.
 - Feel free to suggest new skills or extensions if you think it helps with future sessions.
 
 
