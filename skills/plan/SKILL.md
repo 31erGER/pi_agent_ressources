@@ -144,6 +144,7 @@ Once `.pi/PLAN.md`, the snapshot, and the log entry have been written, immediate
 3. **Explicit Handoff Output:** Output **only** the following completion prompt and wait for the user's explicit go-ahead (`<N>` is the number of the step marked `(CURRENT)`):
 
 *"I have translated your request into a rigorous technical implementation plan in `.pi/PLAN.md`. Should I proceed with Step <N>?"*
+Include details like what is handeld / taken care of by the plan and what is not. Include the limitations of the way the plan or the solution handles things and what the user should be aware of. Also inlcude potential risk and dangers.
 
 - If a previous plan was archived, insert this sentence before the question: *"The previous plan is archived as `.pi/archive/PLAN_<timestamp>.md` (status: <status>)."*
 - If the user chose to finish the old plan (Phase 3), output instead: *"The unfinished plan in `.pi/PLAN.md` stays active. Should I proceed with Step <N>?"*
