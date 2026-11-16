@@ -34,6 +34,15 @@ const SEARCH_CATEGORIES: string[] = [
 
 const SEARCH_PAGE_MAX = 10; // hard cap for the page parameter (SearXNG pageno)
 
+// Appended to the error when SearXNG is unreachable. The extension cannot start Docker itself,
+// but the agent can (if it has a shell tool). The port is derived from SEARXNG_BASE_URL.
+const SEARXNG_PORT = new URL(SEARXNG_BASE_URL).port || "80";
+const SEARXNG_START_HINT =
+    "If the SearXNG container is simply not running, you can start it yourself (only if you have a shell tool): " +
+    `find it with \`docker ps -a --filter publish=${SEARXNG_PORT}\`, start it with \`docker start <container>\` ` +
+    "(or `docker compose up -d` in the folder of its compose file), wait a few seconds, then retry the search once. " +
+    "If Docker itself is not available, tell the user instead.";
+
 // ───────────────────────────────────────────────────────────────
 
 type ResultDetails = Record<string, unknown>;
@@ -107,44 +116,45 @@ const searchTool = defineTool({
     name: "search",
     label: "Web Search",
     description:
-        "Durchsucht das Web über die lokale SearXNG-Instanz nach aktuellen Informationen und Dokumentationen. " +
-        "Liefert die Top-Ergebnisse mit Titel, URL und Snippet.",
+        "Searches the web via the local SearXNG instance for current information and documentation. " +
+        "Returns the top results with title, URL, and snippet.",
     promptSnippet: "Search the web via the local SearXNG instance (titles, URLs, snippets)",
     promptGuidelines: [
         "Use search to look up current web information or documentation.",
         "Use search with max_results when fewer or more results are needed (max 10).",
         "Use search with freshness to look only for recent results (day, week, month, year), category to restrict the result type (e.g. it, news, images), language to pin the result language (e.g. de, en), and page (1–10) to paginate beyond the first result page.",
         "If a filtered search returns no results, retry with fewer filters: on this container, freshness only applies to a small set of engines per category (e.g. 'it' covers only hackernews, 'news' just two), so 0 results can mean that engine set simply had no hits — broaden the category or drop freshness.",
+        "If search fails because SearXNG is not reachable (connection error), its Docker container is probably stopped: if you have a shell tool, start it (the error message explains how) and retry once; otherwise tell the user.",
     ],
     parameters: {
         type: "object",
         properties: {
-            query: { type: "string", description: "Suchbegriff" },
+            query: { type: "string", description: "Search query" },
             max_results: {
                 type: "integer",
                 minimum: 1,
                 maximum: SEARCH_MAX_RESULTS_LIMIT,
-                description: `Anzahl der Ergebnisse (default ${SEARCH_MAX_RESULTS}, max ${SEARCH_MAX_RESULTS_LIMIT})`,
+                description: `Number of results (default ${SEARCH_MAX_RESULTS}, max ${SEARCH_MAX_RESULTS_LIMIT})`,
             },
             freshness: {
                 type: "string",
                 enum: SEARCH_FRESHNESS,
-                description: "Zeitfenster der Ergebnisse (optional): day | week | month | year",
+                description: "Time range for results (optional): day | week | month | year",
             },
             category: {
                 type: "string",
                 enum: SEARCH_CATEGORIES,
-                description: "SearXNG-Kategorie zur Einschränkung des Ergebnis-Typs (optional)",
+                description: "SearXNG category to restrict the result type (optional)",
             },
             language: {
                 type: "string",
-                description: "Ergebnis-Sprache als Locale-Code (optional), z. B. 'de', 'en', 'en-US'",
+                description: "Result language as a locale code (optional), e.g., 'de', 'en', 'en-US'",
             },
             page: {
                 type: "integer",
                 minimum: 1,
                 maximum: SEARCH_PAGE_MAX,
-                description: `Ergebnis-Seite zur Paginierung (optional, 1–${SEARCH_PAGE_MAX})`,
+                description: `Result page for pagination (optional, 1–${SEARCH_PAGE_MAX})`,
             },
         },
         required: ["query"],
@@ -217,7 +227,9 @@ const searchTool = defineTool({
                 .join("\n\n");
             return textResult(text, { query, count: top.length, time_range: freshness, categories: category, language, pageno });
         } catch (err: any) {
-            return errorResult(`search: ${err?.message ?? err} — is the SearXNG docker container running at ${SEARXNG_BASE_URL}?`, { query });
+            // No start hint if the caller aborted the request itself — the container is not the problem then.
+            const hint = signal?.aborted ? "" : ` ${SEARXNG_START_HINT}`;
+            return errorResult(`search: ${err?.message ?? err} — SearXNG is not reachable at ${SEARXNG_BASE_URL}.${hint}`, { query });
         }
     },
 });
@@ -226,9 +238,9 @@ const fetchTool = defineTool({
     name: "fetch",
     label: "Web Fetch",
     description:
-        "Lädt den Textinhalt einer spezifischen http/https-URL direkt herunter (HTML wird lokal in Plain-Text umgewandelt). " +
-        "Lange Seiten werden auf max_chars Zeichen gekürzt und können per offset in Stücken gelesen werden. " +
-        "Mit raw=true wird der Körper unverändert zurückgegeben (z. B. für JSON-APIs).",
+        "Downloads the text content of a specific http/https URL directly (HTML is converted locally to plain text). " +
+        "Long pages are truncated to max_chars characters and can be read in chunks using offset. " +
+        "With raw=true, the body is returned unmodified (e.g., for JSON APIs).",
     promptSnippet: "Fetch a specific http/https URL directly and return its text content (HTML → plain text)",
     promptGuidelines: [
         "Use fetch to read the text content of a specific page URL.",
@@ -238,24 +250,24 @@ const fetchTool = defineTool({
     parameters: {
         type: "object",
         properties: {
-            url: { type: "string", description: "Vollständige http/https URL" },
+            url: { type: "string", description: "Full http/https URL" },
             max_chars: {
                 type: "integer",
                 minimum: FETCH_MIN_CHARS,
-                description: `Maximal zurückzugebende Zeichen (default und Obergrenze ${FETCH_MAX_CHARS})`,
+                description: `Maximum characters to return (default and upper limit ${FETCH_MAX_CHARS})`,
             },
             offset: {
                 type: "integer",
                 minimum: 0,
                 description:
-                    "Startposition in Zeichen zum Lesen langer Seiten in Stücken (default 0). " +
-                    "Wenn die Seite gekürzt wird, erneut aufrufen mit offset=<returned_end> (steht in der Kürzungsnotiz).",
+                    "Start position in characters for reading long pages in chunks (default 0). " +
+                    "If the page is truncated, call again with offset=<returned_end> (shown in the truncation notice).",
             },
             raw: {
                 type: "boolean",
                 description:
-                    "true: Körper unverändert zurückgeben (keine HTML→Text-Umwandlung, keine Content-Type-Prüfung); " +
-                    "max_chars und offset gelten trotzdem. Für JSON-APIs nützlich.",
+                    "true: return body unmodified (no HTML→text conversion, no Content-Type check); " +
+                    "max_chars and offset still apply. Useful for JSON APIs.",
             },
         },
         required: ["url"],

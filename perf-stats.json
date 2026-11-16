@@ -2,46 +2,46 @@
   "version": 1,
   "tools": {
     "read": {
-      "calls": 127,
-      "totalMs": 218,
-      "maxMs": 6,
+      "calls": 138,
+      "totalMs": 242,
+      "maxMs": 7,
       "firstSeen": "2026-11-03T12:47:05.669Z",
-      "lastUsed": "2026-11-10T15:35:21.823Z"
+      "lastUsed": "2026-11-10T20:31:47.472Z"
     },
     "bash": {
-      "calls": 1058,
-      "totalMs": 6612312,
-      "maxMs": 1000003,
+      "calls": 1248,
+      "totalMs": 10599196,
+      "maxMs": 1200075,
       "firstSeen": "2026-11-03T12:47:36.628Z",
-      "lastUsed": "2026-11-10T15:42:15.564Z"
+      "lastUsed": "2026-11-16T07:48:35.338Z"
     },
     "write": {
-      "calls": 80,
-      "totalMs": 92,
-      "maxMs": 4,
+      "calls": 95,
+      "totalMs": 1279,
+      "maxMs": 195,
       "firstSeen": "2026-11-03T12:56:37.582Z",
-      "lastUsed": "2026-11-10T15:33:25.371Z"
+      "lastUsed": "2026-11-12T18:20:37.357Z"
     },
     "edit": {
-      "calls": 204,
-      "totalMs": 455,
-      "maxMs": 16,
+      "calls": 219,
+      "totalMs": 4122,
+      "maxMs": 2623,
       "firstSeen": "2026-11-03T12:58:35.457Z",
-      "lastUsed": "2026-11-10T15:35:40.128Z"
+      "lastUsed": "2026-11-10T20:32:52.965Z"
     },
     "search": {
-      "calls": 13,
-      "totalMs": 10361,
+      "calls": 20,
+      "totalMs": 18141,
       "maxMs": 3011,
       "firstSeen": "2026-11-09T08:50:17.633Z",
-      "lastUsed": "2026-11-09T17:17:28.287Z"
+      "lastUsed": "2026-11-16T07:45:14.340Z"
     },
     "fetch": {
-      "calls": 15,
-      "totalMs": 4011,
-      "maxMs": 1796,
+      "calls": 38,
+      "totalMs": 13896,
+      "maxMs": 4599,
       "firstSeen": "2026-11-09T15:54:24.175Z",
-      "lastUsed": "2026-11-09T17:18:34.286Z"
+      "lastUsed": "2026-11-16T07:45:13.589Z"
     }
   }
 }

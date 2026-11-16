@@ -61,5 +61,41 @@
     "high": "high",
     "xhigh": "xhigh",
     "max": "xhigh"
+  },
+  "qwen3.6-35b-a3b": {
+    "off": "none",
+    "minimal": null,
+    "low": null,
+    "medium": "medium",
+    "high": null,
+    "xhigh": null,
+    "max": null
+  },
+  "image(denoiser)@f16": {
+    "off": "none",
+    "minimal": "minimal",
+    "low": "low",
+    "medium": "medium",
+    "high": "high",
+    "xhigh": "xhigh",
+    "max": "xhigh"
+  },
+  "image(denoiser)@bf16": {
+    "off": "none",
+    "minimal": "minimal",
+    "low": "low",
+    "medium": "medium",
+    "high": "high",
+    "xhigh": "xhigh",
+    "max": "xhigh"
+  },
+  "vae": {
+    "off": "none",
+    "minimal": "minimal",
+    "low": "low",
+    "medium": "medium",
+    "high": "high",
+    "xhigh": "xhigh",
+    "max": "xhigh"
   }
 }
