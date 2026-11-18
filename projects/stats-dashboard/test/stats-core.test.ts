@@ -29,7 +29,11 @@ import statsExt, {
   extractWorkItems,
   fileIntroducedDate,
   formatAddedDate,
+  formatDateTime,
   formatCost,
+  installExtensionCommandTracker,
+  resolveUsageKey,
+  toolOwnerFromList,
   formatDuration,
   formatNumber,
   lastTurnWindow,
@@ -929,9 +933,9 @@ test("formatDuration: s / m+s / h+m / d", () => {
   assert.equal(formatDuration(103_680), "1.2d");
 });
 
-test("formatAddedDate: UTC YYYY-MM-DD, null on missing", () => {
-  assert.equal(formatAddedDate(Date.UTC(2026, 2, 1)), "2026-03-01");
-  assert.equal(formatAddedDate(Date.UTC(2025, 11, 31, 23, 59, 59)), "2025-12-31");
+test("formatAddedDate: UTC DD.MM.YYYY, null on missing", () => {
+  assert.equal(formatAddedDate(Date.UTC(2026, 2, 1)), "01.03.2026");
+  assert.equal(formatAddedDate(Date.UTC(2025, 11, 31, 23, 59, 59)), "31.12.2025");
   assert.equal(formatAddedDate(null), null);
   assert.equal(formatAddedDate(undefined), null);
   assert.equal(formatAddedDate(NaN), null);
@@ -1024,6 +1028,10 @@ test("factory: input + tool events increment the global usage store", () => {
 
   const handlers = new Map<string, unknown[]>();
   let registered: { name: string; handler: unknown } | undefined;
+  // v1.6: an extension-owned tool (file must exist for the attribution guard)
+  const extFile = path.join(dir, "ext", "web-tools.ts");
+  fs.mkdirSync(path.dirname(extFile), { recursive: true });
+  fs.writeFileSync(extFile, "export default () => {}");
   try {
     statsExt({
       registerCommand: (name: string, opts: { description?: string; handler: unknown }) => {
@@ -1035,6 +1043,11 @@ test("factory: input + tool events increment the global usage store", () => {
         handlers.set(event, list);
         return () => {};
       },
+      getAllTools: () => [
+        { name: "fetch", sourceInfo: { path: extFile } },
+        { name: "search", sourceInfo: { path: extFile } },
+        { name: "read", sourceInfo: { path: "builtin:read" } },
+      ],
     } as never);
     assert.equal(registered?.name, "stats");
 
@@ -1047,6 +1060,8 @@ test("factory: input + tool events increment the global usage store", () => {
     fire("tool_execution_start", { type: "tool_execution_start", toolCallId: "1", toolName: "read", args: { path: skillPath } });
     fire("tool_execution_start", { type: "tool_execution_start", toolCallId: "2", toolName: "read", args: { path: "/x/AGENTS.md" } }); // no-op
     fire("tool_execution_start", { type: "tool_execution_start", toolCallId: "3", toolName: "bash", args: { command: "ls" } }); // no-op
+    // v1.6: an extension-owned tool attributes one run to its owning extension
+    fire("tool_execution_start", { type: "tool_execution_start", toolCallId: "4", toolName: "fetch", args: { url: "https://example.com" } });
 
     const data = JSON.parse(fs.readFileSync(file, "utf-8"));
     assert.equal(data.skills.demokill?.count, 1);
@@ -1054,6 +1069,11 @@ test("factory: input + tool events increment the global usage store", () => {
     // v1.3: every tool execution is counted globally (skill reads included)
     assert.equal(data.tools.bash?.count, 1, "bash execution not counted");
     assert.equal(data.tools.read?.count, 2, "both read executions not counted");
+    // v1.6: fetch counted as tool AND attributed to its owning extension file
+    assert.equal(data.tools.fetch?.count, 1, "fetch execution not counted");
+    const realExt = fs.realpathSync(extFile);
+    assert.equal(data.extensions[realExt]?.count, 1, "owning extension not attributed");
+    assert.equal(Object.keys(data.extensions).length, 1, "builtin read must not create an extension key");
   } finally {
     if (prev === undefined) delete process.env.PI_STATS_USAGE_FILE;
     else process.env.PI_STATS_USAGE_FILE = prev;
@@ -1751,6 +1771,125 @@ test("buildStatsColumns: section + role label tables stay aligned with long labe
   }
   assert.ok(roleRows.length >= 2, "role rows present: " + roleRows.join(" | "));
   assertAligned(roleRows, "~", "messages role table");
+});
+
+/* v1.6 — global counters + "last used" column                        */
+/* ------------------------------------------------------------------- */
+
+test("formatDateTime: DD.MM.YYYY HH:MM UTC, null/invalid/zero → null", () => {
+  assert.equal(formatDateTime(Date.parse("2026-11-02T14:05:00Z")), "02.11.2026 14:05");
+  assert.equal(formatDateTime(Date.parse("2026-01-09T00:07:59Z")), "09.01.2026 00:07");
+  assert.equal(formatDateTime(null), null);
+  assert.equal(formatDateTime(undefined), null);
+  assert.equal(formatDateTime(NaN), null);
+  assert.equal(formatDateTime(0), null);
+  assert.equal(formatDateTime(-5), null);
+});
+
+test("installExtensionCommandTracker: counts handled extension commands under the extension path", () => {
+  const NUKES_PATH = "/home/julian/.pi/agent/extensions/nuke-session.ts";
+  class FakeSession {
+    public _extensionRunner = {
+      getCommand: (name: string) =>
+        name === "nuke" ? { sourceInfo: { path: NUKES_PATH } } : undefined,
+    };
+    public async _tryExecuteExtensionCommand(text: string): Promise<boolean> {
+      return text.startsWith("/nuke");
+    }
+  }
+  const tracked: string[] = [];
+  assert.equal(installExtensionCommandTracker((p) => tracked.push(p), FakeSession.prototype), true);
+  void new FakeSession()._tryExecuteExtensionCommand("/nuke"); // registered → counted
+  void new FakeSession()._tryExecuteExtensionCommand("/unknown"); // unregistered → not counted
+  assert.deepEqual(tracked, [NUKES_PATH]);
+});
+
+test("installExtensionCommandTracker: synthetic paths, missing runner, non-string input are skipped", () => {
+  class Synthetic {
+    public _extensionRunner = {
+      getCommand: (name: string) =>
+        name === "b" ? { sourceInfo: { path: "builtin:stats" } } : { sourceInfo: { path: "<inline:cmd>" } },
+    };
+    public async _tryExecuteExtensionCommand(_t: string): Promise<boolean> { return true; }
+  }
+  class NoRunner {
+    public async _tryExecuteExtensionCommand(_t: string): Promise<boolean> { return true; }
+  }
+  const tracked: string[] = [];
+  installExtensionCommandTracker((p) => tracked.push(p), Synthetic.prototype);
+  installExtensionCommandTracker((p) => tracked.push(p), NoRunner.prototype);
+  void new Synthetic()._tryExecuteExtensionCommand("/b");
+  void new Synthetic()._tryExecuteExtensionCommand("/i");
+  void new NoRunner()._tryExecuteExtensionCommand("/x"); // no _extensionRunner → no throw
+  void (new NoRunner() as { _tryExecuteExtensionCommand(t: unknown): Promise<boolean> })._tryExecuteExtensionCommand(123 as never);
+  assert.deepEqual(tracked, []);
+});
+
+test("installExtensionCommandTracker: idempotent (no double counting) + graceful degrade", () => {
+  class Fake2 {
+    public _extensionRunner = { getCommand: () => ({ sourceInfo: { path: "/e/a.ts" } }) };
+    public async _tryExecuteExtensionCommand(_t: string): Promise<boolean> { return true; }
+  }
+  const tracked: string[] = [];
+  assert.equal(installExtensionCommandTracker((p) => tracked.push(p), Fake2.prototype), true);
+  assert.equal(installExtensionCommandTracker((p) => tracked.push(p), Fake2.prototype), true); // no-op
+  void new Fake2()._tryExecuteExtensionCommand("/x");
+  assert.deepEqual(tracked, ["/e/a.ts"], "exactly one track call per command run");
+  class Empty {}
+  assert.equal(installExtensionCommandTracker(() => {}, Empty.prototype), false, "degrades when pi changed internals");
+});
+
+test("toolOwnerFromList: extension paths mapped, builtin/synthetic/missing → null", () => {
+  const m = toolOwnerFromList([
+    { name: "fetch", sourceInfo: { path: "/e/web-tools.ts" } },
+    { name: "search", sourceInfo: { path: "/e/web-tools.ts" } },
+    { name: "read", sourceInfo: { path: "builtin:read" } },
+    { name: "mcpThing", sourceInfo: { path: "<inline:mcp>" } },
+    { name: "none", sourceInfo: null as never },
+    { name: "empty", sourceInfo: { path: "" } },
+  ]);
+  assert.equal(m.get("fetch"), "/e/web-tools.ts");
+  assert.equal(m.get("search"), "/e/web-tools.ts");
+  assert.equal(m.get("read"), null);
+  assert.equal(m.get("mcpThing"), null);
+  assert.equal(m.get("none"), null);
+  assert.equal(m.get("empty"), null);
+  assert.equal(toolOwnerFromList([]).size, 0);
+});
+
+test("buildStatsColumns: usage rows show 'last' (date+time) after 'added', aligned", () => {
+  const d = dashboardData();
+  d.usage.skills = [];
+  d.usage.tools = [];
+  d.usage.extensions = [
+    { name: "very-long-extension-name-xxx.ts", count: 12, added: "16.11.2026", last: "18.11.2026 14:05" },
+    { name: "tiny", count: 1, added: "01.11.2026" },
+    { name: "mid", count: 5, added: "02.10.2026", last: "01.11.2026 08:30" },
+  ];
+  const right = buildStatsColumns(d, 60, 140).right.map((l) => l.text);
+  const start = right.indexOf("usage (global · all sessions)");
+  assert.ok(start >= 0, "usage header present");
+  const rows = right.slice(start + 1).filter((l) => l.includes(" last "));
+  assert.equal(rows.length, 3, "usage rows present: " + rows.join(" | "));
+  assert.ok(rows[0].includes(" added 16.11.2026  last 18.11.2026 14:05"), rows[0]);
+  assert.ok(rows[1].includes(" added 01.11.2026  last ?"), rows[1]);
+  assertAligned(rows, " last ", "usage last column");
+  assertAligned(rows, "added ", "usage added column (still aligned)");
+});
+
+test("resolveUsageKey: realpath-normalizes, literal fallback, file:// support", () => {
+  const dir = makeTmp("resolvekey");
+  const real = path.join(dir, "real.ts");
+  fs.writeFileSync(real, "// x");
+  const link = path.join(dir, "link.ts");
+  fs.symlinkSync(real, link);
+  assert.equal(resolveUsageKey(link), real, "symlink resolves to realpath");
+  assert.equal(resolveUsageKey(real), real);
+  const missing = path.join(dir, "missing.ts");
+  assert.equal(resolveUsageKey(missing), missing, "nonexistent → literal, no throw");
+  assert.equal(resolveUsageKey(`file://${real}`), real, "file:// URL supported");
+  assert.equal(resolveUsageKey(""), null);
+  assert.equal(resolveUsageKey(undefined), null);
 });
 
 console.log(`\n${passed} tests passed`);

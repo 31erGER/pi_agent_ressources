@@ -30,7 +30,6 @@
  *   Logic: projects/lmstudio/lmstudio-efforts.ts (unit-tested).
  */
 import type { ExtensionAPI, ProviderModelConfig } from "@earendil-works/pi-coding-agent";
-import { trackExtensionRun } from "./stats.ts"; // global usage counter (stats extension)
 import { ensureModels, entryToThinkingLevelMap, effortsFileUrl } from "../projects/lmstudio/lmstudio-efforts.ts";
 import type { EffortsFile } from "../projects/lmstudio/lmstudio-efforts.ts";
 
@@ -194,7 +193,7 @@ export default async (pi: ExtensionAPI) => {
   pi.registerCommand("lmstudio", {
     description: "Re-read the model list from LM Studio",
     handler: async (_args, ctx) => {
-      trackExtensionRun(import.meta.url); // /stats global usage counter
+      // v1.6: /lmstudio is counted by the global command tracker in stats.ts
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), 10_000);
       try {

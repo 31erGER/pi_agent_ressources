@@ -131,7 +131,7 @@ the **most efficient way**: git (user approved git where performant).
   - skill use = `/skill:name` invocations + `read` of its SKILL.md (both counted)
   - extension run = invocation of a command it registered (self-reported); for
     event-driven extensions: their main event action (self-reported)
-  - introduced date = file `birthtime` (fallback `mtime`); shown as YYYY-MM-DD
+  - introduced date = file `birthtime` (fallback `mtime`); shown as DD.MM.YYYY
 - **Core Mechanism (performance):** pure `perfStats(items)` over "work items"
   (timestamped generated-token amounts). Work items come from session entries: assistant
   messages + compaction + branch_summary entries that carry `usage` (ISO `timestamp` from
@@ -143,7 +143,7 @@ the **most efficient way**: git (user approved git where performant).
   `usage (global · all sessions)` and `performance (output tokens/s)`.
 - **Acceptance Criteria (v1.1):**
   1. `/stats` dashboard lists every loaded skill and extension with a global use/run
-     counter and an introduced date (YYYY-MM-DD).
+     counter and an introduced date (DD.MM.YYYY).
   2. Counters persist across sessions/processes in one JSON file
      (`~/.pi/agent/usage-stats.json`); a new session sees previous counts.
   3. Running `/stats` increments the stats extension's own counter; running `/lmstudio` /
@@ -231,6 +231,40 @@ the **most efficient way**: git (user approved git where performant).
       non-built-in tools).
 - [x] **Step 5:** README v1.3 (Layout section, tools row, store shape, counting
       semantics, verification numbers).
+
+### v1.6 (global extension counters + last-used column) — DONE
+
+- [x] **Step 1:** PLAN.md (plan skill) — root cause: extension counters depended on
+  per-file self-reports; pi has NO command event, `input` fires after command
+  short-circuit, `pi.getCommands()` returns copies without handlers. Decision:
+  one-time idempotent patch of `AgentSession.prototype._tryExecuteExtensionCommand`
+  + tool→extension attribution via `pi.getAllTools()` sourceInfo.
+  Q1 answered: `last` column = date+time (UTC). Q2 decided: passive always-on
+  extensions stay at `0 runs` (no per-frame counting).
+- [x] **Step 2:** RED tests — `formatDateTime`, `installExtensionCommandTracker`
+  (handled/unhandled/synthetic/missing-runner/non-string/idempotent/degrade),
+  `toolOwnerFromList`, factory tool→extension attribution (fetch → owning file,
+  builtin read → no extension key), usage `last` column render + alignment,
+  `resolveUsageKey` realpath. Verified red (missing export `formatDateTime`).
+- [x] **Step 3:** GREEN in `stats.ts` — `formatDateTime`, `isSyntheticSourcePath`,
+  `toolOwnerFromList`, `installExtensionCommandTracker` (sync counting: command
+  handled ⟺ `runner.getCommand(name)` resolves it — same lookup pi uses; wrapper
+  returns the original promise untouched), realpath in `resolveUsageKey`,
+  `UsageItem.last?` + collectStats + render (`added <10ch>  last <date> <time>`,
+  `last` is the final column), factory wiring (lazy tool-owner cache, invalidation
+  on session_start/resources_discover, tracker install, `/stats` self-report +
+  `selfExtensionKey` removed).
+- [x] **Step 4:** siblings — `confirmation-dialog.ts` gains the dialog self-report
+  (event-driven); `token-counter.ts` + `lmstudio.ts` lose their now-redundant
+  command self-reports (token-counter's used a bare name → phantom key). `notify-on-settle.ts`,
+  `reload-resources.ts` untouched (event-driven). `history-view.ts` / `turn-stats.ts`
+  untouched (user was actively editing them; covered globally).
+- [x] **Step 5:** verification — 65 unit tests + 6 integration checks, tsc --strict
+  clean; `v16-loader-check.mjs` proves the **production identity**: native pi +
+  `discoverAndLoadExtensions` (real loader, all 15 real extensions, 0 errors) →
+  `AgentSession.prototype.__statsCommandTracked === true` on the NATIVE class.
+- [x] **Step 6:** README v1.6 (counting semantics, instrumented list, last column,
+  files, verification) + this SPEC update.
 
 ### v1.4 (changes section — added/deleted lines)
 
@@ -356,6 +390,35 @@ the **most efficient way**: git (user approved git where performant).
     Right-align numerics in a fixed cell computed from the row data (`padStart(maxLen)`),
     and put OPTIONAL annotations (e.g. `· avg 2.5s/call` in the perf rating table)
     after the last aligned column, never between them.
+- **Known Pitfalls (v1.6 — global counter + last column):**
+  - **Module identity is loader-dependent.** The production path (native pi process
+    → `discoverAndLoadExtensions` → loader's jiti) shares ONE `AgentSession` class
+    with the jiti-loaded extension (verified by `v16-loader-check.mjs`). But a
+    standalone `createJiti(import.meta.url, {moduleCache: false}).import(stats.ts)`
+    in a test creates a SEPARATE pi module instance → its factory patches a
+    DIFFERENT `AgentSession.prototype` than a native `import()` sees. Identity
+    assertions must go through the real loader (production mimicry), never through
+    the test's own jiti instance.
+  - **Never break a line between `?` and `.`**: `expr as X)?)\n  ._prop` parses as a
+    ternary with `._prop` as its condition → SyntaxError in BOTH tsc and Node's
+    type-stripping. Keep `self?._runner?.getCommand()` on one line (rebind `this`
+    to a local first if the cast is long).
+  - The v1.5.1 exactly-filled-cell pitfall hit the new `added` cell again:
+    a 10-char date in `padEnd(10)` ate the separator → `added 16.11.2026 last …`.
+    Keep literal spaces OUTSIDE padded cells (`${padEnd(10)}  last ${…}`) and put
+    the variable-width `?` column LAST so nothing can shift behind it.
+  - `registerCommand` stores `{ name, sourceInfo: extension.sourceInfo, ...options }`
+    — `sourceInfo.path` IS the extension file; `getCommand(name)` matches on
+    `invocationName` (duplicated names become `name:1`/`name:2` — a bare
+    `/name` input then resolves to nothing and is correctly not counted).
+  - Counting must be SYNCHRONOUS at call time (command registered ⟺ handled) —
+    the test runner is sync and a `.then()`-based count would race; the wrapper
+    returns the original promise untouched so rejection/error propagation is
+    structurally preserved.
+  - A bare-name self-report (`trackExtensionRun("token-counter")`) resolves against
+    the CWD at run time → phantom store keys that never match the usage table's
+    file-path keys. Always report `import.meta.url`; normalize with realpath in
+    `resolveUsageKey` (nonexistent paths fall back to the literal, no throw).
 
 ## 6. Next Immediate Action
 - **DONE:** v1.3 implemented and verified — two-column layout (LEFT stats | RIGHT
@@ -382,15 +445,28 @@ the **most efficient way**: git (user approved git where performant).
   the last aligned column. 58 unit tests (5 new alignment tests incl. a
   marker-index-same-on-every-row assertion helper) + 5 integration checks, tsc
   --strict clean.
-- **Target (user):** live TUI check of v1.5 + v1.5.1 — **first run `/reload` (or
-  restart pi)** so the running process loads the updated extension (the live process
-  still records no tool durations until reloaded), then open `/stats` with the
-  lmstudio model selected:
-  performance section shows the `last turn` row and (after ~1 s) the
-  `mtp (lm studio) NN% accepted (x/y drafts)` row; RIGHT column shows `perf rating`
-  with 1–5 scores (avg ms/call appears once durations accumulate); `perf/perf-ratings.json`
-  regenerable via `node perf/rate.mjs`; and all table columns stay aligned even with
-  long names (usage table, perf rating, performance windows).
+- **DONE (v1.6):** global extension counters + last-used column — the factory now
+  installs `installExtensionCommandTracker` (one-time idempotent patch of
+  `AgentSession.prototype._tryExecuteExtensionCommand`; every executed extension
+  command counts under its registering extension file — no per-extension line),
+  tool executions attribute to their owning extension via `pi.getAllTools()`
+  sourceInfo (lazy cache, rebuilt on unknown names/session_start/resources_discover;
+  fixes web-tools `fetch`/`search`), all usage keys realpath-normalized,
+  `last` column (UTC `DD.MM.YYYY HH:MM`, final column, `?` fallback) fed by the
+  already-persisted `lastUsed` (no schema change). Siblings: confirmation-dialog
+  self-reports per dialog; token-counter + lmstudio command self-reports removed.
+  65 unit tests + 6 integration checks, tsc --strict clean, production identity
+  proven (v16-loader-check.mjs: all 15 real extensions load, 0 errors, tracker on
+  the native AgentSession.prototype).
+- **Target (user):** live check of v1.5 + v1.5.1 + v1.6 — **run `/reload` (or
+  restart pi) FIRST** so the running process loads the updated extension, then:
+  (1) run `/nuke` or any extension command → its usage counter moves and `last`
+  shows a current date+time; (2) let the agent run a `fetch`/`search` (web-tools)
+  tool → `web-tools.ts` counter moves; (3) trigger a confirmation dialog → its
+  counter moves; (4) open `/stats`: usage table shows aligned `added …  last …`
+  columns (long names still aligned), `last turn` + optional MTP perf rows, perf
+  rating with avg ms/call as durations accumulate. `perf/perf-ratings.json`
+  regenerable via `node perf/rate.mjs`.
 - **Superseded (v1.4):** live TUI check of v1.4 — open `/stats` in a git project, confirm:
   the `changes (this session, git)` section in the LEFT column shows +added -deleted
   with file count (+ untracked line + top-2 files when present); in a non-repo dir it
@@ -405,7 +481,9 @@ the **most efficient way**: git (user approved git where performant).
 - MTP stats for non-lmstudio providers if they ever expose draft counters.
 - Per-session context-growth sparkline (needs per-session local state).
 - Per-message drill-down; RPC/JSON fallback rendering; image token line.
-- Usage trend over time (firstSeen/lastUsed already stored — could render a
-  "last used" column once counters accumulate real data).
-- New extensions added later need the one-line `trackExtensionRun(import.meta.url)` to
-  show non-zero counters (documented in README).
+- Usage trend over time / sparklines (firstSeen/lastUsed already stored — full
+  history would need periodic snapshots, a new store shape).
+  (The "last used" column itself is done — v1.6.)
+  (Counter coverage for new extensions is done — v1.6 global tracker; only
+  event-driven extensions still need the one-line self-report, e.g. per-dialog
+  or per-chime actions that no global hook can observe.)

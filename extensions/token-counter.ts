@@ -33,7 +33,6 @@
  */
 
 import { getAgentDir, type ExtensionAPI, type ExtensionContext, type Theme } from "@earendil-works/pi-coding-agent";
-import { trackExtensionRun } from "./stats.ts"; // global usage counter (stats extension)
 import { appendUsage, seedIfNeeded, sumLedger, type Totals } from "./token-counter-ledger/ledger.ts";
 
 const STATUS_KEY = "global_tokens";
@@ -178,7 +177,8 @@ export default function (pi: ExtensionAPI) {
       enabled = !enabled || args === "on";
       ctx.ui.notify(`Global token counter ${enabled ? "enabled" : "disabled"}`);
       applyStatus();
-      trackExtensionRun("token-counter");
+      // v1.6: /token-counter is counted by the global command tracker in stats.ts
+      // (the old self-report here used a bare name and created a phantom key)
     },
   });
 }

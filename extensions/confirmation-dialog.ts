@@ -51,6 +51,7 @@
  */
 
 import { chime as bell } from "./notify-on-settle.ts";
+import { trackExtensionRun } from "./stats.ts"; // global usage counter (stats extension)
 
 // Test seam: replace the bell in unit tests (keeps the suite silent).
 // Pass null to restore the real chime from notify-on-settle.ts.
@@ -219,6 +220,9 @@ export default function (pi: any) {
     }
 
     try {
+      // v1.6 self-report: event-driven extension (no slash command), so the
+      // global command tracker in stats.ts can't see it — one count per dialog.
+      trackExtensionRun(import.meta.url);
       const ok = await ctx.ui.confirm(
         "confirmation-dialog",
         `The agent wants to run:\n\n${command}\n\nReason for asking: ${reason}.\nAllow this once?`,

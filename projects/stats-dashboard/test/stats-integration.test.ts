@@ -17,6 +17,9 @@
  * 5. v1.5: verifies the MTP probe against the REAL LM Studio (skipped when the
  *    server is down or reports no draft stats) and the perf-store → rating flow
  *    on real session data.
+ * 6. v1.6: verifies the factory installed the global extension-command tracker
+ *    exactly once on the REAL AgentSession.prototype (idempotent second install)
+ *    and the store lastUsed → formatDateTime flow behind the "last" column.
  */
 import { execFileSync } from "node:child_process";
 import * as assert from "node:assert";
@@ -353,4 +356,37 @@ console.log(`  ok - collectStats on real session (${entries.length} entries, ${d
   }
 }
 
-console.log(`\n${5} integration checks passed`);
+// ---------------------------------------- 6) v1.6: global tracker + last column
+{
+  const piPkg = await import(path.join(INSTALL, "@earendil-works/pi-coding-agent/dist/index.js"));
+  const AgentSessionCtor = piPkg.AgentSession as { prototype: Record<string, unknown> };
+  const proto = AgentSessionCtor.prototype;
+
+  // Production mimicry: load ALL real extensions through pi's real loader
+  // (discoverAndLoadExtensions). Verified (v16-loader-check.mjs) that the
+  // jiti-loaded stats factory then patches THIS native AgentSession class.
+  const loadResult = await piPkg.discoverAndLoadExtensions([], "/home/julian", piPkg.getAgentDir());
+  assert.equal(loadResult.errors.length, 0, "real loader loads extensions cleanly");
+  assert.equal(
+    proto.__statsCommandTracked,
+    true,
+    "tracker installed on the AgentSession prototype the real pi process uses",
+  );
+  const before = proto._tryExecuteExtensionCommand;
+  assert.equal(typeof before, "function", "patched prototype method present");
+  assert.equal(ext.installExtensionCommandTracker(() => {}, AgentSessionCtor.prototype), true, "second install reports ok");
+  assert.equal(proto._tryExecuteExtensionCommand, before, "second install is a no-op (no double patching)");
+
+  // real store → lastUsed → formatDateTime: the exact value the dashboard shows
+  ext.trackExtensionRun(EXT_PATH);
+  const store = JSON.parse(fs.readFileSync(STORE_FILE, "utf-8")) as {
+    extensions: Record<string, { count: number; lastUsed: string }>;
+  };
+  const rec = store.extensions[fs.realpathSync(EXT_PATH)];
+  assert.ok(rec && rec.count >= 1, "extension counted via realpath key");
+  const last = ext.formatDateTime(Date.parse(rec.lastUsed));
+  assert.match(last ?? "", /^\d{2}\.\d{2}\.\d{4} \d{2}:\d{2}$/, "last column value has date+time format");
+  console.log(`  ok - v1.6 tracker installed once on real AgentSession.prototype; last column = "${last}" from store`);
+}
+
+console.log(`\n${6} integration checks passed`);

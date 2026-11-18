@@ -52,6 +52,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import {
+  AgentSession,
   buildSessionContext,
   calculateContextTokens,
   estimateTokens,
@@ -182,6 +183,8 @@ export interface UsageItem {
   name: string;
   count: number;
   added: string | null;
+  /** v1.6: when the counter last moved (UTC "YYYY-MM-DD HH:MM"); optional so old fixtures stay valid. */
+  last?: string | null;
 }
 
 export interface UsageSection {
@@ -823,13 +826,24 @@ export function formatDuration(seconds: number): string {
   return `${(s / 86400).toFixed(1).replace(/\.0$/, "")}d`;
 }
 
-/** Milliseconds → UTC "YYYY-MM-DD" (null when missing/invalid). */
+/** Milliseconds → UTC "DD.MM.YYYY" (null when missing/invalid). */
 export function formatAddedDate(ms: number | null | undefined): string | null {
   if (ms == null || !Number.isFinite(ms) || ms <= 0) return null;
   const d = new Date(ms);
   const m = String(d.getUTCMonth() + 1).padStart(2, "0");
   const day = String(d.getUTCDate()).padStart(2, "0");
-  return `${d.getUTCFullYear()}-${m}-${day}`;
+  return `${day}.${m}.${d.getUTCFullYear()}`;
+}
+
+/** v1.6: "DD.MM.YYYY HH:MM" (UTC); null for missing/invalid/zero epochs. */
+export function formatDateTime(ms: number | null | undefined): string | null {
+  if (ms == null || !Number.isFinite(ms) || ms <= 0) return null;
+  const d = new Date(ms);
+  const m = String(d.getUTCMonth() + 1).padStart(2, "0");
+  const day = String(d.getUTCDate()).padStart(2, "0");
+  const h = String(d.getUTCHours()).padStart(2, "0");
+  const min = String(d.getUTCMinutes()).padStart(2, "0");
+  return `${day}.${m}.${d.getUTCFullYear()} ${h}:${min}`;
 }
 
 /** File birthtime ("introduced" date), falling back to mtime; null if unreadable. */
@@ -1028,8 +1042,15 @@ export function perfStats(items: readonly WorkItem[]): PerformanceSection {
 export function resolveUsageKey(referrer: unknown): string | null {
   if (typeof referrer !== "string" || referrer.length === 0) return null;
   try {
-    if (referrer.startsWith("file://")) return fileURLToPath(referrer);
-    return path.resolve(referrer);
+    const p = referrer.startsWith("file://") ? fileURLToPath(referrer) : path.resolve(referrer);
+    try {
+      // canonical key: every counter source (import.meta.url, sourceInfo.path,
+      // the global command tracker) agrees on one path, matching the table's
+      // `resolved` lookup
+      return fs.realpathSync(p);
+    } catch {
+      return p; // nonexistent path (e.g. a bare name) → literal, no throw
+    }
   } catch {
     return null;
   }
@@ -1063,14 +1084,64 @@ export function trackSkillUse(name: string): void {
   }
 }
 
-/** This file's own path, for self-reporting from the /stats handler. */
-function selfExtensionKey(): string | null {
-  try {
-    return resolveUsageKey(import.meta.url);
-  } catch {
-    return null;
-  }
+/** SourceInfo paths that name no file: `builtin:<name>` or `<inline:...>`. */
+export function isSyntheticSourcePath(p: string): boolean {
+  return p.startsWith("builtin:") || (p.startsWith("<") && p.endsWith(">"));
 }
+
+/**
+ * v1.6: map tool name → registering extension file path (null for built-ins,
+ * synthetic sources, or missing info). Pure: the caller feeds pi.getAllTools().
+ */
+export function toolOwnerFromList(
+  tools: ReadonlyArray<{ name: string; sourceInfo?: { path?: string } | null }>,
+): Map<string, string | null> {
+  const m = new Map<string, string | null>();
+  for (const t of tools) {
+    const p = t.sourceInfo?.path;
+    m.set(t.name, typeof p === "string" && p.length > 0 && !isSyntheticSourcePath(p) ? p : null);
+  }
+  return m;
+}
+
+/**
+ * v1.6: global extension-command counter.
+ *
+ * Patches `AgentSession.prototype._tryExecuteExtensionCommand` once (idempotent)
+ * so every executed extension command is counted under the registering
+ * extension's file path — no per-extension instrumentation needed.
+ * Counting is synchronous (a command is handled iff the runner can resolve it)
+ * and the wrapper returns the original promise untouched, so command execution,
+ * results, and error propagation are unaffected.
+ *
+ * Returns false (graceful degradation) if pi changed the internal method.
+ */
+export function installExtensionCommandTracker(
+  track: (extensionPath: string) => void,
+  proto: object = AgentSession.prototype,
+): boolean {
+  const p = proto as Record<string, unknown> & { __statsCommandTracked?: boolean };
+  const orig = p._tryExecuteExtensionCommand;
+  if (typeof orig !== "function") return false; // pi internals changed → degrade
+  if (p.__statsCommandTracked) return true; // idempotent
+  p.__statsCommandTracked = true;
+  p._tryExecuteExtensionCommand = function (this: unknown, text: string): Promise<boolean> {
+    try {
+      if (typeof text === "string" && text.startsWith("/")) {
+        const name = text.slice(1).split(/\s/, 1)[0];
+        const self = this as { _extensionRunner?: { getCommand?: (n: string) => unknown } } | null;
+        const cmd = self?._extensionRunner?.getCommand?.(name) as { sourceInfo?: { path?: string } } | undefined;
+        const cp = cmd?.sourceInfo?.path;
+        if (typeof cp === "string" && cp.length > 0 && !isSyntheticSourcePath(cp)) track(cp);
+      }
+    } catch {
+      // counters must never break command execution
+    }
+    return (orig as (this: unknown, text: string) => Promise<boolean>).call(this, text);
+  };
+  return true;
+}
+
 
 // ------------------------------------------------------------ line building
 
@@ -1466,8 +1537,10 @@ export function buildStatsColumns(d: StatsData, leftWidth: number, rightWidth: n
       addR(`  ${title}`, "dim");
       for (const it of items) {
         const unit = it.count === 1 ? singular : plural;
+        // v1.5.1 alignment rule: `added` cell is fixed 10 chars; `last` is the
+        // LAST column, so its variable `?` fallback shifts nothing behind it
         addR(
-          `    ${it.name.padEnd(usageW)}${String(it.count).padStart(countW)} ${unit.padEnd(4)} added ${it.added ?? "?"}`,
+          `    ${it.name.padEnd(usageW)}${String(it.count).padStart(countW)} ${unit.padEnd(4)} added ${(it.added ?? "?").padEnd(10)}  last ${it.last ?? "?"}`,
           "dim",
         );
       }
@@ -1753,15 +1826,18 @@ export function collectStats(pi: ResourcesLike, ctx: StatsContextLike, opts: Col
   const perfData = new PerfStore(opts.perfStorePath).snapshot();
   const addedFor = (resolved: string | undefined): string | null =>
     resolved ? formatAddedDate(fileIntroducedDate(resolved)) : null;
+  // v1.6: last-used column (store already persists lastUsed per record)
+  const lastFor = (rec: UsageRecord | undefined): string | null =>
+    rec ? formatDateTime(Date.parse(rec.lastUsed)) : null;
   const usage: UsageSection = {
     skills: resources.skills
-      .map((s) => ({ name: s.name, count: usageData.skills[s.name]?.count ?? 0, added: addedFor(s.resolved) }))
+      .map((s) => ({ name: s.name, count: usageData.skills[s.name]?.count ?? 0, added: addedFor(s.resolved), last: lastFor(usageData.skills[s.name]) }))
       .sort((a, b) => b.count - a.count || a.name.localeCompare(b.name)),
     extensions: resources.extensions
-      .map((e) => ({ name: e.name, count: usageData.extensions[e.resolved ?? e.path]?.count ?? 0, added: addedFor(e.resolved) }))
+      .map((e) => ({ name: e.name, count: usageData.extensions[e.resolved ?? e.path]?.count ?? 0, added: addedFor(e.resolved), last: lastFor(usageData.extensions[e.resolved ?? e.path]) }))
       .sort((a, b) => b.count - a.count || a.name.localeCompare(b.name)),
     tools: resources.tools
-      .map((t) => ({ name: t, count: usageData.tools[t]?.count ?? 0, added: formatAddedDate(toolIntroducedDate(t)) }))
+      .map((t) => ({ name: t, count: usageData.tools[t]?.count ?? 0, added: formatAddedDate(toolIntroducedDate(t)), last: lastFor(usageData.tools[t]) }))
       .sort((a, b) => b.count - a.count || a.name.localeCompare(b.name)),
   };
   const performance = perfStats(extractWorkItems(entries));
@@ -2032,6 +2108,15 @@ export default function (pi: ExtensionAPI): void {
   const toolStartTimes = new Map<string, number>();
   pi.on("tool_execution_start", (event) => {
     trackToolUse(event.toolName);
+    // v1.6: attribute the run to the extension that registered the tool
+    const owner = toolOwnerPath(event.toolName);
+    if (owner) {
+      try {
+        if (fs.existsSync(owner)) trackExtensionRun(owner);
+      } catch {
+        // never break tool execution over a stats counter
+      }
+    }
     if (toolStartTimes.size > 2000) toolStartTimes.clear();
     toolStartTimes.set(event.toolCallId, Date.now());
     const name = skillUseFromRead(event.toolName, event.args, skillIndexNow());
@@ -2050,9 +2135,41 @@ export default function (pi: ExtensionAPI): void {
       }
     }
   });
-  pi.on("session_start", invalidateSkillIndex);
+  // v1.6: tool name → registering extension path (lazy cache; rebuilt when a
+  // tool name is unknown — covers MCP tools registered later or after /reload)
+  let toolOwners: Map<string, string | null> | undefined;
+  const toolOwnerPath = (name: string): string | null => {
+    const rebuild = (): Map<string, string | null> => {
+      try {
+        return toolOwnerFromList(pi.getAllTools());
+      } catch {
+        return new Map<string, string | null>();
+      }
+    };
+    if (!toolOwners) toolOwners = rebuild();
+    if (toolOwners.has(name)) return toolOwners.get(name) ?? null;
+    toolOwners = rebuild();
+    return toolOwners.get(name) ?? null;
+  };
+
+  // v1.6: count every extension command globally — no per-extension line
+  // needed. Event-driven extensions (chime, reload, confirmation dialog) keep
+  // their one-line self-report; command-driven ones are covered here.
+  installExtensionCommandTracker((extensionPath) => {
+    try {
+      if (fs.existsSync(extensionPath)) trackExtensionRun(extensionPath);
+    } catch {
+      // counters must never break command execution
+    }
+  });
+
+  pi.on("session_start", () => {
+    invalidateSkillIndex();
+    toolOwners = undefined;
+  });
   pi.on("resources_discover", (event) => {
     invalidateSkillIndex();
+    toolOwners = undefined;
     // v1.4: session-start baseline for the changes section (fires with cwd at
     // startup/reload, i.e. session start); in-memory only, never persisted.
     void captureGitBaseline(event.cwd);
@@ -2061,7 +2178,7 @@ export default function (pi: ExtensionAPI): void {
   pi.registerCommand("stats", {
     description: "Open the live session stats dashboard (overlay; works while the agent is running)",
     handler: async (_args, ctx) => {
-      trackExtensionRun(selfExtensionKey());
+      // v1.6: /stats itself is counted by the global command tracker
       if (ctx.mode !== "tui") {
         ctx.ui.notify("/stats needs the interactive TUI", "warning");
         return;

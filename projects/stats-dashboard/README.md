@@ -1,4 +1,4 @@
-# /stats — pi session dashboard (v1.5)
+# /stats — pi session dashboard (v1.6)
 
 Status: **working**. Live at `~/.pi/agent/extensions/stats.ts` (auto-loaded by pi).
 Spec/plan: `.pi/SPEC.md` · Tests: `test/` (run `npm test` from this dir).
@@ -100,7 +100,7 @@ scroll to the bottom / performance section unreachable):
 | **Changes (this session, git)** (v1.4) | **added/deleted lines** in the cwd since the session started, **code and text combined** (all files, one ± pair): `  +123  -45  · 7 files`, plus `  +89 untracked (3 files)` when untracked files exist, plus `  top: a.ts +60 -10 · b.md +30` (the 2 largest files). States: `…` while the probe runs, `(not a git repo)`, `(git unavailable: reason)`. **LEFT column** |
 | Loaded resources | context files, skills, prompts, extensions with project/user/path scope — same discovery rules as the core loader (mirrors `reload-resources.ts`); long lists wrap. **RIGHT column** |
 | **Tools (n)** (v1.3) | tool names parsed from the final system prompt's `<tools>` section (incl. dynamic/MCP tools). **RIGHT column** |
-| **Usage (global · all sessions)** (v1.1, tools in v1.3) | every loaded **skill**, **extension** and **tool** with a **global counter** (persisted across sessions/processes in `~/.pi/agent/usage-stats.json`) and the **date it was introduced** (skill/extension: file birthtime → mtime fallback; tool: see Layout). Sorted by counter desc. **RIGHT column** |
+| **Usage (global · all sessions)** (v1.1, tools in v1.3, last-used in v1.6) | every loaded **skill**, **extension** and **tool** with a **global counter** (persisted across sessions/processes in `~/.pi/agent/usage-stats.json`), the **date it was introduced** (skill/extension: file birthtime → mtime fallback; tool: see Layout) and a **last-used** column (v1.6: `added 16.11.2026  last 18.11.2026 14:05`, UTC, `?` when the counter never moved; `last` is the final column so its `?` fallback can't shift anything behind it). Sorted by counter desc. **RIGHT column** |
 | **Performance (output tokens/s)** (v1.1, last turn in v1.5) | average generated tokens per second for the **whole session**, **last 10**, **last 100** turns and the **single last turn** (its own output over the time since the previous item), each with token total + span (`1.2M out / 3h20m (132 turns)`). Zero-span/insufficient windows show `—`. Below them, when on LM Studio: `mtp (lm studio) 88% accepted (21/24 drafts)` (v1.5) |
 | **Perf rating (1 cheap · 5 costly)** (v1.5) | every loaded **extension and tool** rated 1–5 from measured data (duration, global run frequency, static source size/subscriptions); rows `name  N [· avg/call] · M runs`, sorted by rating desc. Criteria: `PERFORMANCE-RATING.md`. **RIGHT column** |
 
@@ -143,21 +143,37 @@ processes can't diverge); a corrupt file resets to empty instead of crashing.
 - **tool run** (v1.3) = every `tool_execution_start` (any tool, incl. dynamic/MCP).
   No filtering: the counter answers "how often does pi actually execute each tool",
   globally across all sessions.
-- **extension run** = a self-report. Extension commands are **invisible** to global
+- **extension run** = counted globally (v1.6), with a one-line self-report kept
+  only for **event-driven** extensions. Extension commands are invisible to global
   listeners (`AgentSession.prompt()` executes them *before* the `input` event fires and
-  records nothing in the session), so each extension carries one line in its
-  command/main-action handler: `trackExtensionRun(import.meta.url)` (imported from
-  `./stats.ts`, which is why the helpers live in stats.ts — a standalone helper file in
-  `extensions/` would fail pi's loader, which rejects modules without a function default
-  export).
+  records nothing in the session), so v1.6 installs a **global command tracker**:
+  `stats.ts` patches `AgentSession.prototype._tryExecuteExtensionCommand` once
+  (idempotent, degrades to a no-op if pi renames the internal). Every executed
+  extension command is counted under the registering extension's file path, resolved
+  via `runner.getCommand(name).sourceInfo.path` — the same lookup pi itself uses. No
+  per-extension code needed; new extensions are counted from the start.
+  Tool executions are attributed the same way: `pi.getAllTools()` maps each tool to its
+  owning extension (lazy cache, rebuilt on unknown names / session_start /
+  resources_discover, so late MCP tools and `/reload`-reloaded tools are covered), and
+  every `tool_execution_start` increments **both** the tool counter and the owning
+  extension's counter (fixes `web-tools`: its `fetch`/`search` runs now count).
+  All keys are `realpathSync`-normalized so `import.meta.url`, `sourceInfo.path` and
+  the table's `resolved` lookup always agree.
 
-**Instrumented siblings (one import + one call each, nothing else touched):**
-- `lmstudio.ts` — per `/lmstudio` invocation
-- `token-counter.ts` — per `/token-counter` invocation
+**Self-reporting siblings (event-driven only — the only remaining case, one import +
+one call each):**
 - `notify-on-settle.ts` — per chime (non-aborted `agent_settled`)
-- `session-name-border.ts` — per session start (TUI mode)
 - `reload-resources.ts` — per `/reload` re-print
-- `stats.ts` — per `/stats` invocation (self-reported in its own handler)
+- `confirmation-dialog.ts` — per dialog shown (`tool_call` gate; v1.6)
+
+**No longer self-reported (removed in v1.6 — covered by the global tracker):**
+`stats.ts` (`/stats`), `token-counter.ts` (`/token-counter` — its old line used a bare
+name and created a phantom store key), `lmstudio.ts` (`/lmstudio`).
+
+**Passive always-on extensions** (e.g. `session-name-border.ts`, `turn-stats.ts` — no
+discrete run, rendering per TUI frame) are intentionally **not** counted; their usage
+row shows `0 runs`. (v1.6 decision Q2: counting per-frame work would be noisy and
+expensive; `runs` measures discrete, user-visible actions.)
 
 ## Performance section (v1.1) — definition
 
@@ -211,11 +227,12 @@ with v1.5 — until then tool rows show run counts only and average 1 on duratio
 ## Files
 
 - `~/.pi/agent/extensions/stats.ts` — the extension (single file, pure core exported)
-- `~/.pi/agent/projects/stats-dashboard/test/stats-core.test.ts` — 58 unit tests (node-native, no deps)
-- `~/.pi/agent/projects/stats-dashboard/test/stats-integration.test.ts` — jiti load + real-session smoke test + global-store + jiti-client self-report + git probe + MTP probe checks
+- `~/.pi/agent/projects/stats-dashboard/test/stats-core.test.ts` — 65 unit tests (node-native, no deps)
+- `~/.pi/agent/projects/stats-dashboard/test/stats-integration.test.ts` — jiti load + real-session smoke test + global-store + jiti-client self-report + git probe + MTP probe + **v1.6 global-tracker identity** checks
 - `~/.pi/agent/projects/stats-dashboard/PERFORMANCE-RATING.md` — v1.5 rating criteria (bands, weights, data sources, limitations)
 - `~/.pi/agent/projects/stats-dashboard/perf/rate.mjs` — v1.5 generator: reads both global stores → `perf/perf-ratings.json` + printed table
 - `~/.pi/agent/projects/stats-dashboard/perf/perf-ratings.json` — generated ratings (regenerate: `node perf/rate.mjs`)
+- `~/.pi/agent/projects/stats-dashboard/v16-loader-check.mjs` — v1.6 production-identity check: native pi + real loader + real extensions → proves the tracker patches the `AgentSession` class the real pi process uses
 - `~/.pi/agent/projects/stats-dashboard/.pi/SPEC.md` — spec, guardrails, known pitfalls, future ideas
 - `~/.pi/agent/extensions/package.json` — `{"type":"module"}` so Node/tsc/jiti agree on ESM (pi's loader ignores it; other extensions use pure ESM syntax)
 
@@ -231,16 +248,18 @@ npm test                 # unit + integration
 node /home/julian/.npm/_npx/a322a253dbd59f36/node_modules/typescript/bin/tsc -p tsconfig.json
 ```
 
-Verified: **58 unit tests + 5 integration checks** pass (incl. a real temp git repo:
+Verified: **65 unit tests + 6 integration checks** pass (incl. a real temp git repo:
 session-scoped counts, committed-work-still-counts, not-a-repo, TTL-cache identity,
-resources_discover baseline capture; and the **live MTP probe** against the running LM
-Studio: 88% accepted on qwen/qwen3.8-27b, cache identity verified); `tsc --strict`
-clean; `discoverAndLoadExtensions` (pi's real loader) loads **all six** extensions
-(five now import `./stats.ts` for the usage counter) with zero errors; the real
-`/stats` handler self-reported its execution through `import.meta.url` under jiti;
-dashboard rendered against a real session (1138 entries / 556 turns at last run) in the
-two-column layout (LEFT session | RIGHT environment, middle divider, tools + global
-usage + perf rating).
+resources_discover baseline capture; the **live MTP probe** against the running LM
+Studio: 88% accepted on qwen/qwen3.8-27b, cache identity verified; and the **v1.6
+check**: the factory installs the global command tracker exactly once on the real
+`AgentSession.prototype` and the store's `lastUsed` flows into the `last` column);
+`tsc --strict` clean; `discoverAndLoadExtensions` (pi's real loader) loads **all 15**
+extensions with zero errors; `v16-loader-check.mjs` proves the jiti-loaded factory
+patches the **same** `AgentSession` class as a native pi process (the module-identity
+question that a plain jiti test cannot answer); dashboard rendered against a real
+session in the two-column layout (LEFT session | RIGHT environment, middle divider,
+tools + global usage incl. `last` column + perf rating).
 
 v1.2 verification: end-to-end harness driving the **real** `TuiMainScreen`/`TuiAltScreen`
 proved (a) first frame shows the bottom border, (b) keyboard scroll position survives
@@ -252,7 +271,8 @@ passthrough in regular mode.
 - No persistent per-session history of context growth (snapshot only)
 - Per-message drill-down (click-to-jump would need TUI selection state)
 - No RPC/JSON fallback rendering (those modes notify instead of opening the overlay)
-- Usage trend over time (`firstSeen`/`lastUsed` are already stored — a "last used"
-  column or sparkline is the obvious next step)
-- Counters only cover the six auto-loaded extensions (anything added later needs the
-  one-line `trackExtensionRun` to appear non-zero)
+- ~~Usage trend over time — "last used" column~~ **done in v1.6** (date+time, UTC)
+- ~~Counters only cover the instrumented extensions~~ **done in v1.6** (global command
+  tracker + tool→extension attribution; new extensions are counted without any edit)
+- Sparkline of counter history over time (`firstSeen`/`lastUsed` are already stored —
+  full history would need periodic snapshots, a new store shape)
