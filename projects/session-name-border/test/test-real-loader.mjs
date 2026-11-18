@@ -105,13 +105,13 @@ check(
 	plain,
 );
 
-// long name -> path + 70 a + ...
+// long name -> 70 a + ... + path (flipped: name left, path right)
 sessionName = "a".repeat(100);
 lines = editor.render(100);
 plain = strip(lines[0]);
 check(
-	"long name: 70 a + dots (border budget fits)",
-	plain === DASH.repeat(6) + " ~/projects/demo • " + "a".repeat(70) + "..." + " " + DASH && visibleWidth(lines[0]) === 100,
+	"long name: 70 a + dots + path (border budget fits)",
+	plain === DASH.repeat(6) + " " + "a".repeat(70) + "..." + " • ~/projects/demo " + DASH && visibleWidth(lines[0]) === 100,
 	plain,
 );
 

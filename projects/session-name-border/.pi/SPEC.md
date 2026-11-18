@@ -14,29 +14,40 @@ original footer).
 **v3:** the built-in footer is **overridden in the SAME file** so that
 deleting this single extension file restores pi's original look and feel.
 
-**v4 (current):** the footer override now drops the entire first
+**v4:** the footer override now drops the entire first
 (path/branch) line of the built-in footer — not just the ` • name`
 suffix — saving a row of UI space, since the path (and the name) are
 already shown in the top border. The custom footer is the built-in footer
 minus that pwd line, byte-identical on every remaining line.
 
+**v5 (current):** flipped label sides in the top border — the session
+name is now on the LEFT, the path on the RIGHT: `name • ~/some/path`
+(user request: "the session name is on the right and the path on the
+left at the border — flip sides"). Consequence for the left-anchored
+truncation: the name (primary info) is now the part that survives
+narrow-terminal truncation; the path is the part that gets `...`
+(first) and can disappear entirely below ~30 columns.
+
 ## 2. Technical Architecture & Data Flow
-- **Top border (v2, unchanged):** the editor's top border (`lines[0]` of
+- **Top border (v5 label order; v2 mechanics):** the editor's top border (`lines[0]` of
   `Editor.render()`) is rewritten by a `CustomEditor` subclass
   (`embedWorkingStatus: true`). `appendSessionName()` finds the trailing `─`
   run in the ANSI-stripped line and replaces it with one single
   `borderColor`-colored segment `<filler>─ <label> ─`.
-- **Label:** `formatCwd(ctx.sessionManager.getCwd(), HOME)`
-  (+ ` • <capName(name)>` when a non-empty name is set; no name → path
-  alone; whitespace name → path alone). `formatCwd` replicates the
-  built-in footer's `formatCwdForFooter` (home → `~`, outside home → raw).
-  Git branch intentionally not in the border label.
+- **Label (v5, flipped):** `<capName(name)> • formatCwd(cwd, HOME)` when
+  a non-empty name is set; no/whitespace name → path alone. Name on the
+  left, path on the right. `formatCwd` replicates the built-in footer's
+  `formatCwdForFooter` (home → `~`, outside home → raw). Git branch
+  intentionally not in the border label.
 - **Truncation (label "stuck to the left"):**
   1. Name part: `visibleWidth > 70` → first 70 visible columns + `...`
      (dots always appended on truncation — see fixed bug in §5).
   2. Full label wider than the border budget (`trailing - 3`): re-truncate
      the whole label from the right with `...` (no dots when budget < 4:
-     show as much as fits; budget ≤ 0: plain border).
+     show as much as fits; budget ≤ 0: plain border). v5 consequence:
+     re-truncation eats the PATH first (name start is never cut); with a
+     capped 70-col name the path can be cut to `~` (w80) or vanish
+     entirely (w60 → `dddd...`, path gone).
 - **Footer (v4):** `ctx.ui.setFooter(factory)` — the factory wraps pi's
   **real `FooterComponent`** (root-exported) with a session shim and drops
   the first rendered line (always the pwd/branch line in the built-in
@@ -90,7 +101,7 @@ minus that pwd line, byte-identical on every remaining line.
   - `formatCwd()` — `~` abbreviation (replicated, unexported in pi).
   - `capName()` — 70-column name cap + `...`.
   - `appendSessionName()` — trailing-dash-run splice, left-anchored fitting,
-    single colored tail segment.
+    single colored tail segment. (v5: label order is now `name • path`.)
   - `SessionNameEditor extends CustomEditor` — `render()` override.
   - `createNamelessSession(ctx)` — live session shim + name-masking Proxy.
   - `NamelessFooter` — Component wrapper around the real `FooterComponent`
@@ -199,9 +210,12 @@ minus that pwd line, byte-identical on every remaining line.
   stay byte-identical.
 
 ## 6. Next Immediate Action
-- **Target:** code complete and verified (v3). Nothing pending.
-- **Next Command:** user live-TUI smoke test (Step 5), then delete-file
-  revert check. Re-run harness any time:
+- **Target:** v5 (flipped label: `name • path`) code complete and
+  verified — both mock + real-loader suites ALL PASSED (2025-11-16).
+- **Next Command:** user live-TUI smoke test of the flipped border
+  (name left / path right; narrow terminal → name survives, path
+  truncated first; `/name ''` → path alone), then delete-file revert
+  check. Re-run harness any time:
   `cd ~/.pi/agent/projects/session-name-border/test && node test.mjs &&
   node test-real-loader.mjs` (tsc: `cd /tmp/snb-test &&
   ./node_modules/.bin/tsc -p ../.../test/tsconfig.json`).

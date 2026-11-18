@@ -5,10 +5,10 @@
  * restores pi's original look and feel:
  *
  *  1. TOP BORDER (right side of the colored line):
- *         ─────── ~/some/path • my session name ───────
- *     Path with `~` abbreviation (same logic as the original footer), name
- *     part capped at 70 visible columns; the label is "stuck to the left" —
- *     the beginning is always shown, only the right end gets `...`.
+ *         ─────── my session name • ~/some/path ───────
+ *     Name part capped at 70 visible columns, path with `~` abbreviation
+ *     (same logic as the original footer); the label is "stuck to the
+ *     left" — the beginning is always shown, only the right end gets `...`.
  *
  *  2. FOOTER: the original built-in footer minus its first (path/branch)
  *     line, which is gone entirely to save a row of UI space — the path
@@ -76,7 +76,7 @@ function capName(name: string): string {
  * (possibly ANSI-colored) border, right-anchored: `<filler>─ <label> ─`.
  * The label text itself is left-anchored: when the label is wider than the
  * available run it is re-truncated from the right (`...`), so the beginning
- * (path, then name start) is never the part that gets cut. Returns the
+ * (name, then path start) is never the part that gets cut. Returns the
  * original line when there is no room at all.
  */
 function appendSessionName(
@@ -112,7 +112,7 @@ function appendSessionName(
 
 /**
  * The border extension: same as pi's editor, but the top border shows the
- * path + session name on the right.
+ * session name + path on the right.
  */
 class SessionNameEditor extends CustomEditor {
     constructor(
@@ -213,12 +213,12 @@ export default function sessionNameBorder(pi: ExtensionAPI) {
     pi.on("session_start", (_event, ctx) => {
         if (ctx.mode !== "tui") return;
 
-        // 1) Top border: path + name on the right.
+        // 1) Top border: name + path on the right.
         const home = process.env.HOME ?? process.env.USERPROFILE;
         const getLabel = () => {
             const cwd = formatCwd(ctx.sessionManager.getCwd(), home);
             const name = (ctx.sessionManager.getSessionName() ?? "").trim();
-            return name ? `${cwd} • ${capName(name)}` : cwd;
+            return name ? `${capName(name)} • ${cwd}` : cwd;
         };
         ctx.ui.setEditorComponent(
             (tui, theme, keybindings) =>
