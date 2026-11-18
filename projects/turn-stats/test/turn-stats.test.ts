@@ -11,7 +11,7 @@
  * Part 2: integration — the real extension default export driven with a mock
  *          ExtensionAPI: agent_start -> message_end* -> agent_settled.
  */
-process.env.TZ = "UTC"; // deterministic clock formatting (must run before any formatClock call)
+process.env.TZ = "UTC"; // deterministic clock formatting (must run before any formatDateTime call)
 
 import { Box } from "@earendil-works/pi-tui";
 import turnStatsExt, {
@@ -21,7 +21,7 @@ import turnStatsExt, {
   formatThinkingLine,
   thinkingStats,
   finishTurn,
-  formatClock,
+  formatDateTime,
   formatCost,
   formatDuration,
   formatLiveLine,
@@ -135,9 +135,14 @@ const T1 = Date.parse("2025-11-03T14:32:05.000Z"); // T0 + 42.3s later? -> 65s; 
   check("formatCost: normal -> 2 decimals", formatCost(0.1234) === "$0.1234" && formatCost(12.345) === "$12.35");
 }
 
-// formatClock
+// formatDateTime (v4: date + time)
 {
-  check("formatClock: 24h UTC", formatClock(T1) === "14:32:05", formatClock(T1));
+  check("formatDateTime: DD.MM.YYYY HH:MM:SS, zero-padded",
+    formatDateTime(T1) === "03.11.2025 14:32:05",
+    formatDateTime(T1));
+  check("formatDateTime: single-digit month/day/hour padded",
+    formatDateTime(Date.parse("2025-01-02T03:04:05.000Z")) === "02.01.2025 03:04:05",
+    formatDateTime(Date.parse("2025-01-02T03:04:05.000Z")));
 }
 
 // formatTurnLine
@@ -149,12 +154,12 @@ const T1 = Date.parse("2025-11-03T14:32:05.000Z"); // T0 + 42.3s later? -> 65s; 
   // 567 out / 65s = 8.72... -> "8.7 tok/s"
   check(
     "formatTurnLine: all required stats present",
-    formatTurnLine(base) === `⏱ 1m 5s · ↑ 12,340 in · ↓ 567 out · 8.7 tok/s · $0.0042 · 14:32:05`,
+    formatTurnLine(base) === `⏱ 1m 5s · ↑ 12,340 in · ↓ 567 out · 8.7 tok/s · $0.0042 · 03.11.2025 14:32:05`,
     formatTurnLine(base),
   );
   check(
     "formatTurnLine: cost segment omitted when 0",
-    formatTurnLine({ ...base, cost: 0 }) === `⏱ 1m 5s · ↑ 12,340 in · ↓ 567 out · 8.7 tok/s · 14:32:05`,
+    formatTurnLine({ ...base, cost: 0 }) === `⏱ 1m 5s · ↑ 12,340 in · ↓ 567 out · 8.7 tok/s · 03.11.2025 14:32:05`,
     formatTurnLine({ ...base, cost: 0 }),
   );
   check(
@@ -425,8 +430,9 @@ const theme = {
     rendered);
   const box2 = render({ customType: "turn-stats", data }, { expanded: true }, theme) as Box;
   const rendered2 = box2.render(100).join("");
-  check("renderer: expanded view shows cache read + started",
-    rendered2.includes("cache read 123") && rendered2.includes("model calls"), rendered2);
+  check("renderer: expanded view shows cache read + started (with date, v4)",
+    rendered2.includes("cache read 123") && rendered2.includes("model calls") &&
+    rendered2.includes("started 03.11.2025 14:31:00"), rendered2);
   const box3 = render({ customType: "turn-stats", data: undefined }, { expanded: false }, theme) as Box;
   check("renderer: missing data renders without throwing", box3 instanceof Box);
 }

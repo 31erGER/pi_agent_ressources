@@ -4,7 +4,7 @@
  * After every turn (a full run: user prompt -> agent idle) it prints one dim
  * line into the chat transcript, e.g.:
  *
- *   ⏱ 42.3s · ↑ 12,340 in · ↓ 567 out · 13.4 tok/s · $0.0042 · 14:32:05
+ *   ⏱ 42.3s · ↑ 12,340 in · ↓ 567 out · 13.4 tok/s · $0.0042 · 03.11.2025 14:32:05
  *
  *   (aborted runs get an "· aborted" suffix; cost is omitted when it is 0;
  *    expanding the line shows cache-read tokens, start time and model-call count)
@@ -151,9 +151,11 @@ export function formatCost(c: number): string {
   return `$${c < 1 ? c.toFixed(4) : c.toFixed(2)}`;
 }
 
-/** 24h wall clock, e.g. "14:32:05". */
-export function formatClock(ts: number): string {
-  return new Date(ts).toLocaleTimeString("en-GB", { hour12: false });
+/** Local date + 24h time, e.g. "03.11.2025 14:32:05". */
+export function formatDateTime(ts: number): string {
+  const d = new Date(ts);
+  const p = (n: number) => String(n).padStart(2, "0");
+  return `${p(d.getDate())}.${p(d.getMonth() + 1)}.${d.getFullYear()} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
 }
 
 /** The one-line chat rendering of a finished turn. */
@@ -165,7 +167,7 @@ export function formatTurnLine(d: TurnStatsData): string {
     `${tokensPerSec(d).toFixed(1)} tok/s`,
   ];
   if (d.cost > 0) parts.push(formatCost(d.cost));
-  parts.push(formatClock(d.finishedAt));
+  parts.push(formatDateTime(d.finishedAt));
   if (d.aborted) parts.push("aborted");
   return parts.join(" · ");
 }
@@ -393,7 +395,7 @@ export default function (pi: ExtensionAPI, options: TurnStatsOptions = {}): void
         new Text(
           theme.fg(
             "dim",
-            `cache read ${formatNumber(data.cacheRead)} · started ${formatClock(data.startedAt)} · ${data.modelCalls} model call${data.modelCalls === 1 ? "" : "s"}`,
+            `cache read ${formatNumber(data.cacheRead)} · started ${formatDateTime(data.startedAt)} · ${data.modelCalls} model call${data.modelCalls === 1 ? "" : "s"}`,
           ),
           0,
           0,

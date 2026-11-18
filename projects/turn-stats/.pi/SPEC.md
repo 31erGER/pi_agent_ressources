@@ -110,7 +110,7 @@
 
 ### 7.3 Checklist (v2)
 - [x] **S1:** SPEC updated (this section) — verify: file read
-- [x] **S2 (CURRENT):** RED — add live-core + widget integration tests to
+- [x] **S2:** RED — add live-core + widget integration tests to
       `test/turn-stats.test.ts` — verify: `node test/turn-stats.test.ts` fails
       (missing `liveStats`/`formatLiveLine`, no setWidget calls)
 - [x] **S3:** GREEN — extend `turn-stats.ts` (ticker, liveUsage capture, widget
@@ -172,7 +172,7 @@
 
 ### 8.3 Checklist (v3)
 - [x] **S1:** SPEC updated (this section) — verify: file read
-- [x] **S2 (CURRENT):** RED — thinking-core + integration tests in
+- [x] **S2:** RED — thinking-core + integration tests in
       `test/turn-stats.test.ts` — verify: `node test/turn-stats.test.ts` fails
       (missing exports / no entries appended on thinking events)
 - [x] **S3:** GREEN — extend `turn-stats.ts` (span tracking, thinking_end /
@@ -192,3 +192,40 @@
   text of the block (pi-ai types) — that is the estimation input.
 - One statement per thinking block means noisy turns get several lines —
   that is the requested behavior; do not silently dedupe.
+
+## 9. v4 — Date in the turn-end timestamp
+
+### 9.1 Human Requirement (Original Intent)
+> Extend the timestamp at the end of the turn line by the date: I want date
+> AND time, not just time.
+
+### 9.2 Architecture & Data Flow
+- **Core Mechanism:** `formatClock` (24h time only) is replaced by
+  `formatDateTime` returning local `YYYY-MM-DD HH:MM:SS` (zero-padded,
+  manual formatting — deterministic, no locale variance). It is used for
+  both timestamps: the end time at the end of the turn line and the
+  `started …` time in the expanded view, so a turn spanning midnight stays
+  unambiguous.
+- **Data / Control Flow:** unchanged apart from the string formatting:
+  `finishTurn` → `formatTurnLine` → `formatDateTime(finishedAt)`;
+  expanded renderer line → `formatDateTime(startedAt)`.
+- **Acceptance Criteria:**
+  1. Turn line ends with `· 2025-11-03 14:32:05` for T1 under TZ=UTC.
+  2. Expanded view shows `started 2025-11-03 14:31:00`.
+  3. `formatClock` is gone (renamed), typecheck clean, all previous
+     behaviors unchanged (71 prior tests stay green).
+
+### 9.3 Checklist (v4)
+- [x] **S1:** SPEC updated (this section) — verify: file read
+- [x] **S2:** RED — update tests to expect date+time
+      — verify: `node test/turn-stats.test.ts` fails
+- [x] **S3:** GREEN — rename `formatClock` → `formatDateTime` with new
+      implementation + both call sites — verify: tests pass
+- [x] **S4:** typecheck + loader-check — verify: clean
+
+### 9.4 Negative Knowledge (v4)
+- `toLocaleString` output varies by locale/ICU — keep the manual
+  zero-padding approach (the old `toLocaleTimeString("en-GB")` was pinned
+  but date+time is simpler and locale-proof hand-rolled).
+- Use LOCAL time (as before via local getters), not `toISOString()` (UTC) —
+  the line must match the user's wall clock.
