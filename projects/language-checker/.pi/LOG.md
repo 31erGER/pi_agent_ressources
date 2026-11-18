@@ -45,3 +45,11 @@
 - Gates: `node --test test/` → pass 27, fail 0; loadtest → ALL LOADED exit 0 (language-checker/index.ts OK, default export function); tsc 5.9.2 → 0 errors.
 - Added extensions/language-checker/README.md; cleaned .pi/ scratch probes.
 - Status: implementation complete — only user manual E2E remains (see PLAN §6).
+
+### 2026-11-18 11:19 · Post-completion change · default ON (opt-out) · done
+- Request: user wants the checker ON by default instead of opt-in.
+- Design: install on `session_start`, but DEFERRED by one macrotask (`setTimeout(0)`). Verified in pi 1.5.2 `core/extensions/runner.js` that `emit()` awaits session_start handlers in alphabetical extension order — language-checker (l) runs BEFORE session-name-border (s), so a synchronous install would be clobbered; the deferral runs after all handlers and wraps the LAST installed factory. Guards: `userPref === false` respected (explicit opt-out persists across resume/fork within the process; fresh module = default ON again); `current === installedFactory` identity check prevents self-wrapping on repeated session_start.
+- TDD: wrote test/index.test.ts (4 tests: default-ON wrapping of a later extension's editor; /spelling OFF restores exact factory + ON re-wraps; explicit OFF persists across simulated session switches; fresh module defaults ON). RED confirmed (4/4 failed: nothing installed on session start), then implemented index.ts (install/uninstall helpers, session_start handler, userPref state) → GREEN.
+- Decisions: default enable is SILENT (no startup notification spam — red underlines are the visible feedback); explicit /spelling toggles still notify.
+- Gates: `node --test test/` → 31/31; loadtest → ALL LOADED exit 0; tsc 5.9.2 → 0 errors (after fixing a bad return-type annotation on loadExtension: `Promise<(pi) => void>`, not an extra `=> void` wrap).
+- Docs: extension README updated (Usage = ON by default; deferred-install rationale in the file table); PLAN §5 guardrail updated from "install only from /spelling" to the deferred-install solution.
